@@ -9,11 +9,11 @@ from typing import Final, Literal, Protocol, Self, cast
 import gymnasium as gym
 from gymnasium.envs.registration import register, registry  # pyright: ignore[reportUnknownVariableType]
 
-from brogue_gym._render import TerminalCharset, observation_to_ansi
-from brogue_gym.actions import Action
-from brogue_gym.brogue import BackendInfoKey, BackendReset, BackendStep, BrogueBackend, ObservationDict
-from brogue_gym.snapshot import BrogueSnapshot
-from brogue_gym.spaces import (
+from broguegym._render import TerminalCharset, observation_to_ansi
+from broguegym.actions import Action
+from broguegym.brogue import BackendInfoKey, BackendReset, BackendStep, BrogueBackend, ObservationDict
+from broguegym.snapshot import BrogueSnapshot
+from broguegym.spaces import (
     ActionSet,
     ObservationMode,
     action_description,
@@ -49,7 +49,7 @@ def register_envs() -> None:
         return
     register(
         id=BROGUE_ENV_ID,
-        entry_point="brogue_gym.gym:BrogueEnv",
+        entry_point="broguegym.gym:BrogueEnv",
     )
 
 

@@ -1,4 +1,4 @@
-# brogue-gym
+# broguegym
 
 Gymnasium environment for [Brogue CE](https://github.com/tmewett/BrogueCE).
 
@@ -13,10 +13,10 @@ uv sync
 Single environment (Gymnasium API):
 
 ```python
-import brogue_gym
+import broguegym
 import gymnasium as gym
 
-env = gym.make(brogue_gym.BROGUE_ENV_ID)
+env = gym.make(broguegym.BROGUE_ENV_ID)
 obs, info = env.reset(seed=42)
 obs, reward, term, trunc, info = env.step(env.action_space.sample())
 env.close()
@@ -25,7 +25,7 @@ env.close()
 Batched (for training):
 
 ```python
-from brogue_gym import BrogueBackend
+from broguegym import BrogueBackend
 
 backend = BrogueBackend(num_envs=64)
 resets = backend.reset_many(seed=42)

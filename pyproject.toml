@@ -1,5 +1,5 @@
 [project]
-name = "brogue-gym"
+name = "broguegym"
 version = "0.1.0"
 description = "A Gymnasium-compatible Python harness for driving Brogue CE as an RL environment."
 readme = "README.md"
@@ -50,7 +50,7 @@ cache-keys = [
 testpaths = ["tests"]
 
 [tool.pyright]
-include = ["brogue_gym", "tests"]
+include = ["broguegym", "tests"]
 exclude = ["BrogueCE", ".venv"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"

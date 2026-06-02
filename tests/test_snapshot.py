@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from brogue_gym.snapshot import BrogueSnapshot
+from broguegym.snapshot import BrogueSnapshot
 
 
 def test_snapshot_round_trips_through_memory_and_file(tmp_path: Path) -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from brogue_gym.actions import ActionKind, BrogueInput
-from brogue_gym.spaces import (
+from broguegym.actions import ActionKind, BrogueInput
+from broguegym.spaces import (
     ACTION_DESCRIPTIONS,
     ACTION_INPUTS,
     ACTION_KEYS,

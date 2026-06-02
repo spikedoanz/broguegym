@@ -1,4 +1,4 @@
-"""PEP 517 build backend for brogue-gym's Python package and native bridge."""
+"""PEP 517 build backend for broguegym's Python package and native bridge."""
 
 from __future__ import annotations
 

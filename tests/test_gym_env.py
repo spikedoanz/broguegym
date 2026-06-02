@@ -9,13 +9,13 @@ import numpy as np
 import pytest
 from gymnasium.utils.env_checker import check_env  # pyright: ignore[reportUnknownVariableType]
 
-from brogue_gym import BROGUE_ENV_ID
-from brogue_gym.actions import Action, BrogueInput
-from brogue_gym.brogue import BackendInfoKey, BackendReset, BackendStep, ObservationDict, _default_library_path
-from brogue_gym.gym import BrogueEnv
-from brogue_gym.snapshot import BrogueSnapshot
-from brogue_gym.spaces import ACTIONS, FULL_ACTIONS, empty_observation
-from brogue_gym.brogue import BrogueBackend
+from broguegym import BROGUE_ENV_ID
+from broguegym.actions import Action, BrogueInput
+from broguegym.brogue import BackendInfoKey, BackendReset, BackendStep, ObservationDict, _default_library_path
+from broguegym.gym import BrogueEnv
+from broguegym.snapshot import BrogueSnapshot
+from broguegym.spaces import ACTIONS, FULL_ACTIONS, empty_observation
+from broguegym.brogue import BrogueBackend
 
 
 class FakeBackend:

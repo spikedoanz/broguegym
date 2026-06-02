@@ -20,8 +20,8 @@ from multiprocessing.connection import Connection
 from multiprocessing.shared_memory import SharedMemory
 from numpy.typing import NDArray
 
-from brogue_gym.actions import Action
-from brogue_gym.snapshot import BrogueSnapshot
+from broguegym.actions import Action
+from broguegym.snapshot import BrogueSnapshot
 
 __all__ = [
     "BackendErrorCode",

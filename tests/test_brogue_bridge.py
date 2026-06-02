@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from brogue_gym.actions import Action, ActionKind, Direction
-from brogue_gym.brogue import (
+from broguegym.actions import Action, ActionKind, Direction
+from broguegym.brogue import (
     BackendErrorCode,
     BackendInfoKey,
     _InProcessBrogue,
@@ -16,8 +16,8 @@ from brogue_gym.brogue import (
     _default_library_path,
     _observation_from_c,
 )
-from brogue_gym.gym import BrogueEnv
-from brogue_gym.spaces import ACTIONS, INVENTORY_STR_LENGTH, SCREEN_COLS, SCREEN_ROWS
+from broguegym.gym import BrogueEnv
+from broguegym.spaces import ACTIONS, INVENTORY_STR_LENGTH, SCREEN_COLS, SCREEN_ROWS
 
 G_TRAP = 198
 G_BLOODWORT_STALK = 225

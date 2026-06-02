@@ -6,8 +6,8 @@ import time
 
 import numpy as np
 
-from brogue_gym.actions import Action, ActionKind
-from brogue_gym.brogue import BrogueBackend
+from broguegym.actions import Action, ActionKind
+from broguegym.brogue import BrogueBackend
 
 
 def find_explore_action() -> Action:

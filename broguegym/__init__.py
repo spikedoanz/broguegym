@@ -1,7 +1,7 @@
 """Typed Python tools for driving Brogue CE as a Gymnasium RL environment."""
 
-from brogue_gym.brogue import BrogueBackend
-from brogue_gym.gym import BROGUE_ENV_ID, BrogueEnv, register_envs
+from broguegym.brogue import BrogueBackend
+from broguegym.gym import BROGUE_ENV_ID, BrogueEnv, register_envs
 
 register_envs()
 
