@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,7 +29,7 @@ class CustomBuildHook(BuildHookInterface[Any]):
             msg = f"Brogue bridge build did not produce {bridge_library}"
             raise FileNotFoundError(msg)
 
-        build_data["tag"] = _platform_wheel_tag()
+        build_data["tag"] = _platform_wheel_tag(bridge_library)
         build_data["pure_python"] = False
         build_data["force_include"].update(
             {
@@ -52,18 +54,35 @@ def _bridge_library_name() -> str:
     return f"libbruhogue_brogue{suffix}"
 
 
-def _platform_wheel_tag() -> str:
-    from hatchling.builders.macos import process_macos_plat_tag
-    from packaging.tags import sys_tags
+def _platform_wheel_tag(bridge_library: Path) -> str:
+    system = platform.system()
+    machine = _normalized_machine()
+    if system == "Darwin":
+        platform_tag = f"macosx_{_macos_deployment_target(bridge_library)}_{machine}"
+    elif system == "Linux":
+        platform_tag = f"linux_{machine}"
+    else:
+        msg = f"unsupported Brogue bridge wheel platform: {system} {machine}"
+        raise RuntimeError(msg)
+    return f"py3-none-{platform_tag}"
 
-    tag = next(
-        iter(
-            tag
-            for tag in sys_tags()
-            if "manylinux" not in tag.platform and "musllinux" not in tag.platform
-        ),
+
+def _normalized_machine() -> str:
+    machine = platform.machine().lower().replace("-", "_")
+    return {
+        "amd64": "x86_64",
+        "aarch64": "arm64" if platform.system() == "Darwin" else "aarch64",
+    }.get(machine, machine)
+
+
+def _macos_deployment_target(bridge_library: Path) -> str:
+    output = subprocess.check_output(
+        ["otool", "-l", str(bridge_library)],
+        text=True,
     )
-    platform = tag.platform
-    if sys.platform == "darwin":
-        platform = process_macos_plat_tag(platform, compat=True)
-    return f"py3-none-{platform}"
+    if match := re.search(r"\bminos\s+(\d+)\.(\d+)", output):
+        return f"{match.group(1)}_{match.group(2)}"
+    if match := re.search(r"\bversion\s+(\d+)\.(\d+)", output):
+        return f"{match.group(1)}_{match.group(2)}"
+    msg = f"could not detect macOS deployment target for {bridge_library}"
+    raise RuntimeError(msg)
