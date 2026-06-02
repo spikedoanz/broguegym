@@ -1,4 +1,4 @@
-"""PEP 517 build backend for broguegym's Python package and native bridge."""
+"""Hatch build hook for bundling Brogue's native bridge runtime."""
 
 from __future__ import annotations
 
@@ -6,9 +6,8 @@ import platform
 import re
 import subprocess
 import sys
-from importlib import import_module
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
@@ -48,21 +47,6 @@ class CustomBuildHook(BuildHookInterface[Any]):
             cwd=root,
             check=True,
         )
-
-
-def build_editable(*args: Any, **kwargs: Any) -> str:
-    hatchling = import_module("hatchling.build")
-    return cast(str, hatchling.build_editable(*args, **kwargs))
-
-
-def build_wheel(*args: Any, **kwargs: Any) -> str:
-    hatchling = import_module("hatchling.build")
-    return cast(str, hatchling.build_wheel(*args, **kwargs))
-
-
-def build_sdist(*args: Any, **kwargs: Any) -> str:
-    hatchling = import_module("hatchling.build")
-    return cast(str, hatchling.build_sdist(*args, **kwargs))
 
 
 def _bridge_library_name() -> str:
