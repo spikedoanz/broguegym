@@ -1,4 +1,3 @@
 [submodule "BrogueCE"]
 	path = BrogueCE
-	url = git@github.com:spikedoanz/BrogueCE.git
-	branch = bridge
+	url = git@github.com:spikedoanz/BrogueGE.git
