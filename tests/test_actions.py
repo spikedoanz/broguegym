@@ -4,7 +4,7 @@ from typing import Any, cast
 
 import pytest
 
-from bruhogue.actions import Action, ActionKind, BrogueInput, Direction
+from brogue_gym.actions import Action, ActionKind, BrogueInput, Direction
 
 
 def test_direction_actions_encode_to_brogue_keys() -> None:

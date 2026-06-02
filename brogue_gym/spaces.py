@@ -8,8 +8,8 @@ from typing import Final, Literal
 import numpy as np
 from gymnasium import spaces
 
-from bruhogue.actions import Action, ActionKind, BrogueInput, Direction
-from bruhogue.brogue import ObservationDict
+from brogue_gym.actions import Action, ActionKind, BrogueInput, Direction
+from brogue_gym.brogue import ObservationDict
 
 SCREEN_COLS: Final = 100
 SCREEN_ROWS: Final = 34

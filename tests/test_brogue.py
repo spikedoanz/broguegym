@@ -12,17 +12,17 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-import bruhogue.brogue as brogue_backend_module
-from bruhogue.actions import Action, ActionKind
-from bruhogue.brogue import (
+import brogue_gym.brogue as brogue_backend_module
+from brogue_gym.actions import Action, ActionKind
+from brogue_gym.brogue import (
     BackendErrorCode,
     BackendInfoKey,
     BackendReset,
     BackendUnavailableError,
     _default_library_path,
 )
-from bruhogue.brogue import BrogueBackend
-from bruhogue.spaces import SCREEN_COLS, SCREEN_ROWS
+from brogue_gym.brogue import BrogueBackend
+from brogue_gym.spaces import SCREEN_COLS, SCREEN_ROWS
 
 _REST = Action(kind=ActionKind.REST)
 _EXPLORE = Action(kind=ActionKind.EXPLORE)

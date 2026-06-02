@@ -1,6 +1,6 @@
-# bruhogue
+# brogue-gym
 
-`bruhogue` is a Gymnasium-compatible Python harness for turning Brogue CE into a
+`brogue-gym` is a Gymnasium-compatible Python harness for turning Brogue CE into a
 reinforcement-learning environment.
 
 The design follows the NLE (NetHack Learning Environment) in-process model: training code imports
@@ -11,7 +11,7 @@ is a narrow in-process bridge API. See `docs/nle-process-model.md` for implement
 
 - `BrogueCE/` — Brogue CE source, vendored as a submodule so bridge changes can be reviewed and
   evolved alongside the Python harness.
-- `bruhogue/` — typed Python package with the Gymnasium wrapper, action table, Brogue backend
+- `brogue_gym/` — typed Python package with the Gymnasium wrapper, action table, Brogue backend
   contract, observation spaces, and snapshot file format.
 - `examples/` — local scripts for interactive play.
 - `docs/nle-process-model.md` — implementation notes for the in-process Brogue bridge.
@@ -34,10 +34,10 @@ pip install .
 ## Quick start
 
 ```python
-import bruhogue
+import brogue_gym
 import gymnasium as gym
 
-env = gym.make(bruhogue.BROGUE_ENV_ID)
+env = gym.make(brogue_gym.BROGUE_ENV_ID)
 observation, info = env.reset(seed=1)
 
 action = env.action_space.sample()

@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from bruhogue.actions import Action, BrogueInput
-from bruhogue.brogue import (
+from brogue_gym.actions import Action, BrogueInput
+from brogue_gym.brogue import (
     BackendErrorCode,
     BackendInfoKey,
     BackendUnavailableError,
@@ -23,7 +23,7 @@ from bruhogue.brogue import (
 )
 
 if TYPE_CHECKING:
-    from bruhogue.gym import BrogueEnv
+    from brogue_gym.gym import BrogueEnv
 
 type KeyEvent = tuple[str, bool, bool]
 
@@ -36,7 +36,7 @@ def main() -> None:
     parser.add_argument("--actions", default=None, help="Replay raw keys instead of reading stdin.")
     parser.add_argument("--tensors", action="store_true", help="Print privileged tensor reprs.")
     args = parser.parse_args()
-    from bruhogue.gym import BrogueEnv
+    from brogue_gym.gym import BrogueEnv
 
     env = BrogueEnv(
         render_mode="ansi",
