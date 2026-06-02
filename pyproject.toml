@@ -1,0 +1,57 @@
+[project]
+name = "bruhogue"
+version = "0.1.0"
+description = "A Gymnasium-compatible Python harness for driving Brogue CE as an RL environment."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "spikedoanz" }]
+dependencies = [
+    "gymnasium>=1.3.0",
+    "jaxtyping>=0.3.9",
+    "msgspec>=0.21.1",
+    "numpy>=2.4.6",
+    "typing-extensions>=4.12.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+    "pytest>=8.3.0",
+]
+
+[build-system]
+requires = ["hatchling", "editables"]
+build-backend = "build"
+backend-path = ["."]
+
+[tool.uv]
+package = true
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "build.py" },
+    { file = "BrogueCE/Makefile" },
+    { file = "BrogueCE/config.mk" },
+    { file = "BrogueCE/make/**/*.mk" },
+    { file = "BrogueCE/src/**/*.c" },
+    { file = "BrogueCE/src/**/*.h" },
+    { file = "BrogueCE/tools/git-extra-version" },
+    { git = { commit = true } },
+    { env = "CC" },
+    { env = "CFLAGS" },
+    { env = "CPPFLAGS" },
+    { env = "LDLIBS" },
+    { env = "GITHUB_ACTIONS" },
+    { env = "GITHUB_REF" },
+    { env = "GITHUB_SHA" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["bruhogue", "tests"]
+exclude = ["BrogueCE", ".venv"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false

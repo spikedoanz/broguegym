@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.env
+dist/
+build/
+docs/papers/
+*.egg-info/
+
+# Local runtime artifacts
+*.log
+*.broguesave
+BrogueRunHistory.txt
+BrogueCE/bin/libbruhogue_*.so
+BrogueCE/bin/libbruhogue_*.dylib
+server-socket
+client-socket
+brogue-web.txt
+headless-runs/
+pi-headless-runs/
+runs/
+
+.env

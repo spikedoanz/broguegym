@@ -1,0 +1,4 @@
+[submodule "BrogueCE"]
+	path = BrogueCE
+	url = git@github.com:spikedoanz/BrogueCE.git
+	branch = bridge
