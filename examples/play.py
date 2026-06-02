@@ -33,6 +33,7 @@ TENSOR_PREFIXES = ("map_", "inventory_")
 def main() -> None:
     parser = argparse.ArgumentParser(description="Play Brogue through the in-process bridge.")
     parser.add_argument("--seed", type=int, default=None, help="Optional Brogue-job sampler seed.")
+    parser.add_argument("--game-seed", type=int, default=None, help="Optional concrete Brogue game seed override.")
     parser.add_argument("--actions", default=None, help="Replay raw keys instead of reading stdin.")
     parser.add_argument("--tensors", action="store_true", help="Print privileged tensor reprs.")
     args = parser.parse_args()
@@ -45,7 +46,10 @@ def main() -> None:
     )
     step_count = 0
     try:
-        last_observation, info = env.reset(seed=args.seed)
+        reset_options: dict[str, object] | None = None
+        if args.game_seed is not None:
+            reset_options = {"game_seed": args.game_seed}
+        last_observation, info = env.reset(seed=args.seed, options=reset_options)
         _emit("reset", step_count, last_observation, info, env.render(), tensors=args.tensors)
         action_lookup = _action_lookup(env.actions)
         events = _scripted(args.actions)

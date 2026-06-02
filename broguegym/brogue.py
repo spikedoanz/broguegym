@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import ctypes
 import multiprocessing as mp
-import secrets
 import sys
 import traceback
 from collections.abc import Sequence
@@ -29,7 +28,7 @@ __all__ = [
     "BackendReset",
     "BackendStep",
     "BackendUnavailableError",
-    "BrogueBackend",
+    "BrogueVectorEnv",
     "ObservationDict",
 ]
 
@@ -116,11 +115,12 @@ class _InProcessBrogue:
     def reset(
         self,
         *,
-        seed: int | None = None,
+        seed: BrogueSeedSpec = None,
+        game_seed: BrogueGameSeedSpec | None = None,
     ) -> BackendReset:
         """Start a new game through the C bridge."""
 
-        seed_value = _bridge_seed(seed)
+        seed_value = _resolve_brogue_seeds(seed, 1, game_seed)[0]
         self._validate_data_dir()
         if self._state is BackendSessionState.RUNNING:
             self.close()
@@ -277,7 +277,6 @@ _INVENTORY_STR_LENGTH = 80
 _INVENTORY_STR_CELLS = _INVENTORY_SIZE * _INVENTORY_STR_LENGTH
 _PROGRAM_TERMINATED_INDEX = 1
 _PROGRAM_SEED_INDEX = 4
-_GYM_ZERO_BRIDGE_SEED = 0x9E3779B97F4A7C15
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _PACKAGED_DATA_DIR = _PACKAGE_ROOT / "_native" / "bin"
 
@@ -331,7 +330,7 @@ class _ObservationField(msgspec.Struct, frozen=True, kw_only=True, forbid_unknow
 
 
 # Field specification for building zero-copy strided numpy views.
-# Used by process-backed BrogueBackend to alias the raw C observation buffer directly.
+# Used by process-backed BrogueVectorEnv to alias the raw C observation buffer directly.
 _OBS_FIELD_SPECS: tuple[_ObservationField, ...] = (
     _ObservationField(name="glyphs", dtype=np.int16, shape=(_SCREEN_ROWS, _SCREEN_COLS)),
     _ObservationField(name="chars", dtype=np.uint32, shape=(_SCREEN_ROWS, _SCREEN_COLS)),
@@ -493,17 +492,6 @@ def _copy_into(source: Any, dest: NDArray[np.generic]) -> None:
     np.copyto(dest.ravel(), flat)
 
 
-def _bridge_seed(seed: int | None) -> int:
-    if seed is None:
-        return secrets.randbits(64) or 1  # avoid 0 which triggers time-based seed on C side
-    if seed < 0 or seed > 2**64 - 1:
-        msg = "Brogue seed must be an unsigned 64-bit integer"
-        raise ValueError(msg)
-    if seed == 0:
-        return _GYM_ZERO_BRIDGE_SEED
-    return seed
-
-
 def _bridge_key(key: str) -> int:
     encoded = key.encode("latin-1")
     if len(encoded) != 1:
@@ -526,7 +514,8 @@ _BROGUE_SEED_MAX = 2**64 - 1
 _WORKER_CLOSE_TIMEOUT_SECONDS = 1.0
 _WORKER_TERMINATE_TIMEOUT_SECONDS = 5.0
 
-type BrogueSeedSpec = int | NDArray[np.integer[Any]] | None
+type BrogueSeedSpec = int | None
+type BrogueGameSeedSpec = int | Sequence[int]
 
 
 class _ProcessWorker(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
@@ -602,7 +591,7 @@ def _process_worker_main(connection: Connection, shm_name: str, env_id: int) -> 
                     return
                 if operation == "reset":
                     seed = cast(int, command[1])
-                    result = backend.reset(seed=seed)
+                    result = backend.reset(game_seed=seed)
                     _copy_observation(result.observation, observation)
                     connection.send(("reset", result.info))
                     continue
@@ -642,20 +631,41 @@ def _validate_sampler_seed(seed: int | None) -> int:
     return seed
 
 
-def _manual_brogue_seeds(seed_array: NDArray[np.integer[Any]], count: int) -> list[int]:
-    if seed_array.shape != (count,):
-        msg = f"expected manual Brogue seed override array with shape ({count},), got {seed_array.shape}"
+def _validate_manual_game_seed(seed: object) -> int:
+    if isinstance(seed, int):
+        seed_value = seed
+    elif isinstance(seed, np.integer):
+        seed_value = int(cast(Any, seed))
+    else:
+        msg = "game_seed must be an integer or a sequence of integers"
+        raise TypeError(msg)
+    if seed_value < _BROGUE_SEED_MIN or seed_value > _BROGUE_SEED_MAX:
+        msg = "game_seed must be in [1, 2**64 - 1]"
         raise ValueError(msg)
-    if not np.issubdtype(seed_array.dtype, np.integer):
-        msg = "manual Brogue seed overrides must be an integer ndarray"
+    return seed_value
+
+
+def _manual_game_seed_array(
+    game_seed: BrogueGameSeedSpec,
+    count: int,
+) -> NDArray[np.uint64]:
+    if isinstance(game_seed, int):
+        seed = _validate_manual_game_seed(game_seed)
+        return np.full(count, seed, dtype=np.uint64)
+    if isinstance(game_seed, (str, bytes, bytearray)):
+        msg = "game_seed override must be an integer or integer sequence"
         raise TypeError(msg)
 
-    seeds = [int(seed) for seed in seed_array.tolist()]
-    for seed in seeds:
-        if seed < _BROGUE_SEED_MIN or seed > _BROGUE_SEED_MAX:
-            msg = "manual Brogue seed overrides must be in [1, 2**64 - 1]"
-            raise ValueError(msg)
-    return seeds
+    values = list(game_seed)
+    if len(values) != count:
+        msg = f"expected {count} game_seed overrides, got {len(values)}"
+        raise ValueError(msg)
+    seeds = [_validate_manual_game_seed(value) for value in values]
+    return np.asarray(seeds, dtype=np.uint64)
+
+
+def _manual_game_seeds(game_seed: BrogueGameSeedSpec, count: int) -> list[int]:
+    return [int(seed) for seed in _manual_game_seed_array(game_seed, count).tolist()]
 
 
 def _sample_brogue_seeds(seed: int | None, count: int) -> list[int]:
@@ -671,23 +681,27 @@ def _sample_brogue_seeds(seed: int | None, count: int) -> list[int]:
     return [int(seed) for seed in seeds.tolist()]
 
 
-def _resolve_brogue_seeds(seed: object, count: int) -> list[int]:
-    if isinstance(seed, np.ndarray):
-        return _manual_brogue_seeds(cast(NDArray[np.integer[Any]], seed), count)
+def _resolve_brogue_seeds(
+    seed: object,
+    count: int,
+    game_seed: BrogueGameSeedSpec | None = None,
+) -> list[int]:
+    if game_seed is not None:
+        return _manual_game_seeds(game_seed, count)
     if seed is None or isinstance(seed, int):
         return _sample_brogue_seeds(seed, count)
-    msg = "seed must be None, an integer sampler seed, or an integer ndarray of Brogue seed overrides"
+    msg = "seed must be None or an integer sampler seed; use game_seed=... for concrete Brogue seeds"
     raise TypeError(msg)
 
 
-class BrogueBackend:
-    """Run Brogue instances in isolated worker processes.
+class BrogueVectorEnv:
+    """Run a batch of Brogue instances in isolated worker processes.
 
     Each worker process owns one normal in-process Brogue bridge instance. The
     parent process routes reset/step commands over pipes and uses shared memory
     as the worker-to-parent observation transport. Public reset/step results are
     owned arrays so callers cannot retain views into unmapped memory after
-    close(). This keeps the Python experiment path single and makes OS
+    close(). This keeps the Python experiment path batch-native and makes OS
     processes the isolation boundary between Brogue global-state instances.
     """
 
@@ -712,29 +726,24 @@ class BrogueBackend:
 
     def reset(
         self,
-        env_id: int | None = None,
         *,
         seed: BrogueSeedSpec = None,
-    ) -> BackendReset:
-        """Reset one environment.
+        game_seed: BrogueGameSeedSpec | None = None,
+    ) -> list[BackendReset]:
+        """Reset all environments via one command fan-out to worker processes.
 
-        Without *env_id*, this is the scalar ``BrogueBackend`` reset path and is
-        only valid when ``num_envs == 1``. Integer seeds seed the Brogue-job
-        sampler; pass a shape ``(1,)`` integer ndarray to override the concrete
-        Brogue seed manually.
+        ``seed=None`` uses a fixed sampler seed. ``seed=<int>`` uses that integer
+        to sample concrete Brogue seeds for all environments. ``game_seed``
+        overrides sampled values; an int broadcasts, and a sequence must contain
+        one value per environment.
         """
 
-        resolved_env_id = self._scalar_env_id() if env_id is None else env_id
-        self._check_env_id(resolved_env_id)
-        return self._reset_envs([resolved_env_id], _resolve_brogue_seeds(seed, 1))[0]
+        return self._reset_envs(
+            list(range(self.num_envs)),
+            _resolve_brogue_seeds(seed, self.num_envs, game_seed),
+        )
 
-    def step(self, action: Action) -> BackendStep:
-        """Apply one scalar action for ``num_envs == 1``."""
-
-        env_id = self._scalar_env_id()
-        return self.step_many([action])[env_id]
-
-    def step_many(self, actions: Sequence[Action]) -> list[BackendStep]:
+    def step(self, actions: Sequence[Action]) -> list[BackendStep]:
         """Step all environments via one command fan-out to worker processes."""
 
         if len(actions) != self.num_envs:
@@ -757,7 +766,7 @@ class BrogueBackend:
             try:
                 _bridge_key(action.brogue_input().key)
             except ValueError as exc:
-                msg = f"BrogueBackend cannot encode action {action.kind.value}"
+                msg = f"BrogueVectorEnv cannot encode action {action.kind.value}"
                 raise BackendUnavailableError(BackendErrorCode.ACTION_UNENCODABLE, msg) from exc
 
         env_ids = range(self.num_envs)
@@ -797,20 +806,6 @@ class BrogueBackend:
                 ),
             )
         return results
-
-    def reset_many(self, *, seed: BrogueSeedSpec = None) -> list[BackendReset]:
-        """Reset all environments via one command fan-out to worker processes.
-
-        ``seed=None`` uses a fixed sampler seed. ``seed=<int>`` uses that integer
-        to sample concrete Brogue seeds for all environments. Pass a shape
-        ``(num_envs,)`` integer ndarray to manually override the concrete Brogue
-        seeds.
-        """
-
-        return self._reset_envs(
-            list(range(self.num_envs)),
-            _resolve_brogue_seeds(seed, self.num_envs),
-        )
 
     def snapshot(self) -> BrogueSnapshot:
         msg = "process Brogue backend does not expose full-state snapshots yet"
@@ -859,7 +854,7 @@ class BrogueBackend:
         self._obs_views = []
         self._states = [BackendSessionState.CLOSED for _ in range(self.num_envs)]
 
-    def __enter__(self) -> BrogueBackend:
+    def __enter__(self) -> BrogueVectorEnv:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -893,13 +888,18 @@ class BrogueBackend:
         try:
             for env_id in range(self.num_envs):
                 parent_conn, child_conn = ctx.Pipe()
-                process = ctx.Process(
-                    target=_process_worker_main,
-                    args=(child_conn, shared_memory.name, env_id),
-                    daemon=True,
-                )
-                process.start()
-                child_conn.close()
+                try:
+                    process = ctx.Process(
+                        target=_process_worker_main,
+                        args=(child_conn, shared_memory.name, env_id),
+                        daemon=True,
+                    )
+                    process.start()
+                except Exception:
+                    parent_conn.close()
+                    raise
+                finally:
+                    child_conn.close()
                 self._workers.append(_ProcessWorker(process=process, connection=parent_conn))
         except Exception:
             self.close()
@@ -913,10 +913,7 @@ class BrogueBackend:
         if len(env_ids) != len(seeds):
             msg = "env_ids and seeds must have the same length"
             raise ValueError(msg)
-        for seed in seeds:
-            _bridge_seed(seed)
         for env_id in env_ids:
-            self._check_env_id(env_id)
             self._states[env_id] = BackendSessionState.CLOSED
         sent_env_ids: list[int] = []
         try:
@@ -948,17 +945,6 @@ class BrogueBackend:
                 ),
             )
         return results
-
-    def _scalar_env_id(self) -> int:
-        if self.num_envs != 1:
-            msg = "scalar reset/step is only available when num_envs == 1"
-            raise ValueError(msg)
-        return 0
-
-    def _check_env_id(self, env_id: int) -> None:
-        if not (0 <= env_id < self.num_envs):
-            msg = f"env_id {env_id} is out of range [0, {self.num_envs})"
-            raise IndexError(msg)
 
     def _recv_batch_responses(
         self,

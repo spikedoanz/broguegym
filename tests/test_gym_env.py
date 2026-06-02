@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # pyright: reportPrivateUsage=false
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import gymnasium as gym
@@ -11,43 +12,71 @@ from gymnasium.utils.env_checker import check_env  # pyright: ignore[reportUnkno
 
 from broguegym import BROGUE_ENV_ID
 from broguegym.actions import Action, BrogueInput
-from broguegym.brogue import BackendInfoKey, BackendReset, BackendStep, ObservationDict, _default_library_path
+from broguegym.brogue import (
+    BackendInfoKey,
+    BackendReset,
+    BackendStep,
+    BrogueGameSeedSpec,
+    BrogueVectorEnv,
+    ObservationDict,
+    _default_library_path,
+    _sample_brogue_seeds,
+)
 from broguegym.gym import BrogueEnv
 from broguegym.snapshot import BrogueSnapshot
 from broguegym.spaces import ACTIONS, FULL_ACTIONS, empty_observation
-from broguegym.brogue import BrogueBackend
 
 
-class FakeBackend:
+def _fake_reset_info_seed(
+    seed: int | None,
+    game_seed: BrogueGameSeedSpec | None,
+) -> object:
+    if game_seed is None:
+        return seed
+    if isinstance(game_seed, int):
+        return game_seed
+    return list(game_seed)[0]
+
+
+class FakeVectorEnv:
     def __init__(self, *, include_semantic_tensors: bool = False) -> None:
+        self.num_envs = 1
         self.actions: list[Action] = []
         self.closed = False
         self.include_semantic_tensors = include_semantic_tensors
         self.restored: list[BrogueSnapshot] = []
         self.reset_seed: int | None = None
+        self.reset_game_seed: BrogueGameSeedSpec | None = None
 
     def reset(
         self,
         *,
         seed: int | None = None,
-    ) -> BackendReset:
+        game_seed: BrogueGameSeedSpec | None = None,
+    ) -> list[BackendReset]:
         self.actions.clear()
         self.reset_seed = seed
-        return BackendReset(
-            observation=empty_observation(include_semantic_tensors=self.include_semantic_tensors),
-            info={"seed": seed},
-        )
+        self.reset_game_seed = game_seed
+        return [
+            BackendReset(
+                observation=empty_observation(include_semantic_tensors=self.include_semantic_tensors),
+                info={"seed": _fake_reset_info_seed(seed, game_seed)},
+            ),
+        ]
 
-    def step(self, action: Action) -> BackendStep:
+    def step(self, actions: Sequence[Action]) -> list[BackendStep]:
+        action = actions[0]
         self.actions.append(action)
         observation = empty_observation(include_semantic_tensors=self.include_semantic_tensors)
         observation["program_state"][0] = len(self.actions)
-        return BackendStep(
-            observation=observation,
-            reward=1.25,
-            terminated=False,
-            info={"key": action.brogue_key()},
-        )
+        return [
+            BackendStep(
+                observation=observation,
+                reward=1.25,
+                terminated=False,
+                info={"key": action.brogue_key()},
+            ),
+        ]
 
     def snapshot(self) -> BrogueSnapshot:
         return BrogueSnapshot(payload=b"complete-state", metadata={"seed": 123})
@@ -62,7 +91,7 @@ class FakeBackend:
         self.closed = True
 
 
-class ReusingFakeBackend(FakeBackend):
+class ReusingFakeVectorEnv(FakeVectorEnv):
     def __init__(self) -> None:
         super().__init__()
         self.observation = empty_observation()
@@ -71,30 +100,40 @@ class ReusingFakeBackend(FakeBackend):
         self,
         *,
         seed: int | None = None,
-    ) -> BackendReset:
+        game_seed: BrogueGameSeedSpec | None = None,
+    ) -> list[BackendReset]:
         self.reset_seed = seed
+        self.reset_game_seed = game_seed
         self.observation["program_state"][0] = 0
-        return BackendReset(observation=self.observation, info={"seed": seed})
+        return [
+            BackendReset(
+                observation=self.observation,
+                info={"seed": _fake_reset_info_seed(seed, game_seed)},
+            ),
+        ]
 
-    def step(self, action: Action) -> BackendStep:
+    def step(self, actions: Sequence[Action]) -> list[BackendStep]:
+        action = actions[0]
         self.actions.append(action)
         self.observation["program_state"][0] += 1
-        return BackendStep(
-            observation=self.observation,
-            reward=0.0,
-            terminated=False,
-            info={},
-        )
+        return [
+            BackendStep(
+                observation=self.observation,
+                reward=0.0,
+                terminated=False,
+                info={},
+            ),
+        ]
 
 
 def test_env_reset_and_step_dispatch_discrete_actions() -> None:
-    backend = FakeBackend()
-    env = BrogueEnv(backend=backend, max_episode_steps=2)
+    vector_env = FakeVectorEnv()
+    env = BrogueEnv(vector_env=vector_env, max_episode_steps=2)
 
     observation, info = env.reset(seed=7)
     assert env.observation_space.contains(observation)
     assert info == {"seed": 7}
-    assert backend.reset_seed == 7
+    assert vector_env.reset_seed == 7
 
     observation, reward, terminated, truncated, info = env.step(0)
     assert env.observation_space.contains(observation)
@@ -102,16 +141,35 @@ def test_env_reset_and_step_dispatch_discrete_actions() -> None:
     assert terminated is False
     assert truncated is False
     assert info == {"key": ACTIONS[0].brogue_key()}
-    assert backend.actions == [ACTIONS[0]]
+    assert vector_env.actions == [ACTIONS[0]]
 
     _, _, _, truncated, info = env.step(1)
     assert truncated is True
     assert info["TimeLimit.truncated"] is True
 
 
+def test_env_reset_routes_game_seed_option() -> None:
+    vector_env = FakeVectorEnv()
+    env = BrogueEnv(vector_env=vector_env)
+
+    observation, info = env.reset(seed=11, options={"game_seed": 7})
+
+    assert env.observation_space.contains(observation)
+    assert info == {"seed": 7}
+    assert vector_env.reset_seed == 11
+    assert vector_env.reset_game_seed == 7
+
+
+def test_env_reset_rejects_unknown_options() -> None:
+    env = BrogueEnv(vector_env=FakeVectorEnv())
+
+    with pytest.raises(ValueError, match="reset options"):
+        env.reset(options={"unknown": 7})
+
+
 def test_env_observations_are_stable_after_backend_reuses_buffers() -> None:
-    backend = ReusingFakeBackend()
-    env = BrogueEnv(backend=backend)
+    vector_env = ReusingFakeVectorEnv()
+    env = BrogueEnv(vector_env=vector_env)
 
     reset_observation, _ = env.reset()
     step_observation, *_ = env.step(0)
@@ -120,23 +178,23 @@ def test_env_observations_are_stable_after_backend_reuses_buffers() -> None:
     assert int(step_observation["program_state"][0]) == 1
     assert not np.shares_memory(
         reset_observation["program_state"],
-        backend.observation["program_state"],
+        vector_env.observation["program_state"],
     )
     assert not np.shares_memory(
         step_observation["program_state"],
-        backend.observation["program_state"],
+        vector_env.observation["program_state"],
     )
 
 
 def test_env_rejects_invalid_action_index() -> None:
-    env = BrogueEnv(backend=FakeBackend())
+    env = BrogueEnv(vector_env=FakeVectorEnv())
 
     with pytest.raises(ValueError, match="invalid Brogue action"):
         env.step(len(ACTIONS))
 
 
 def test_env_defaults_to_player_observation_and_can_opt_into_privileged_mode() -> None:
-    base_env = BrogueEnv(backend=FakeBackend(include_semantic_tensors=True))
+    base_env = BrogueEnv(vector_env=FakeVectorEnv(include_semantic_tensors=True))
     base_observation, _ = base_env.reset()
 
     assert "glyphs" in base_observation
@@ -146,7 +204,7 @@ def test_env_defaults_to_player_observation_and_can_opt_into_privileged_mode() -
     assert base_env.observation_space.contains(base_observation)
 
     privileged_env = BrogueEnv(
-        backend=FakeBackend(include_semantic_tensors=True),
+        vector_env=FakeVectorEnv(include_semantic_tensors=True),
         observation_mode="privileged",
     )
     privileged_observation, _ = privileged_env.reset()
@@ -158,8 +216,8 @@ def test_env_defaults_to_player_observation_and_can_opt_into_privileged_mode() -
 
 
 def test_env_can_attach_privileged_info_without_policy_observation() -> None:
-    backend = FakeBackend(include_semantic_tensors=True)
-    env = BrogueEnv(backend=backend, include_privileged_info=True)
+    vector_env = FakeVectorEnv(include_semantic_tensors=True)
+    env = BrogueEnv(vector_env=vector_env, include_privileged_info=True)
 
     observation, info = env.reset()
 
@@ -171,8 +229,8 @@ def test_env_can_attach_privileged_info_without_policy_observation() -> None:
 
 
 def test_env_can_use_full_action_profile() -> None:
-    backend = FakeBackend()
-    env = BrogueEnv(backend=backend, actions="full")
+    vector_env = FakeVectorEnv()
+    env = BrogueEnv(vector_env=vector_env, actions="full")
     full_action_index = tuple(action.brogue_input() for action in FULL_ACTIONS).index(
         BrogueInput(key="+"),
     )
@@ -182,7 +240,7 @@ def test_env_can_use_full_action_profile() -> None:
 
     assert len(env.action_descriptions) == len(FULL_ACTIONS)
     assert info == {"key": "+"}
-    assert backend.actions == [Action.keypress("+")]
+    assert vector_env.actions == [Action.keypress("+")]
 
 
 def test_env_registers_with_gymnasium_make() -> None:
@@ -191,7 +249,7 @@ def test_env_registers_with_gymnasium_make() -> None:
         Any,
         make_env(
             BROGUE_ENV_ID,
-            backend=FakeBackend(),
+            vector_env=FakeVectorEnv(),
             disable_env_checker=True,
         ),
     )
@@ -205,18 +263,46 @@ def test_env_registers_with_gymnasium_make() -> None:
         env.close()
 
 
-def test_env_default_backend_uses_process_backend_path_if_built() -> None:
+def test_env_default_vector_env_uses_process_runner_if_built() -> None:
     if not _default_library_path().exists():
         pytest.skip("run through uv so package sync builds the bridge")
     env = BrogueEnv()
     try:
-        assert isinstance(env.backend, BrogueBackend)
+        assert isinstance(env.vector_env, BrogueVectorEnv)
+    finally:
+        env.close()
+
+
+def test_env_default_backend_reset_seed_is_sampler_seed_if_built() -> None:
+    if not _default_library_path().exists():
+        pytest.skip("run through uv so package sync builds the bridge")
+    env = BrogueEnv()
+    try:
+        expected_seed = _sample_brogue_seeds(42, 1)[0]
+        observation, info = env.reset(seed=42)
+
+        assert info[BackendInfoKey.SEED] == expected_seed
+        assert int(observation["program_state"][4]) == expected_seed
+        assert expected_seed != 42
+    finally:
+        env.close()
+
+
+def test_env_default_backend_reset_game_seed_override_if_built() -> None:
+    if not _default_library_path().exists():
+        pytest.skip("run through uv so package sync builds the bridge")
+    env = BrogueEnv()
+    try:
+        observation, info = env.reset(seed=11, options={"game_seed": 42})
+
+        assert info[BackendInfoKey.SEED] == 42
+        assert int(observation["program_state"][4]) == 42
     finally:
         env.close()
 
 
 def test_env_render_includes_ansi_colors_when_present() -> None:
-    env = BrogueEnv(backend=FakeBackend(), render_mode="ansi")
+    env = BrogueEnv(vector_env=FakeVectorEnv(), render_mode="ansi")
 
     observation, _ = env.reset()
     observation["chars"][0, 0] = ord("@")
@@ -230,7 +316,7 @@ def test_env_render_includes_ansi_colors_when_present() -> None:
 
 
 def test_env_render_defaults_to_ascii_charset_for_unicode_glyphs() -> None:
-    env = BrogueEnv(backend=FakeBackend(), render_mode="ansi")
+    env = BrogueEnv(vector_env=FakeVectorEnv(), render_mode="ansi")
 
     observation, _ = env.reset()
     observation["glyphs"][0, 0] = 198
@@ -245,4 +331,4 @@ def test_env_render_defaults_to_ascii_charset_for_unicode_glyphs() -> None:
 
 
 def test_env_passes_gymnasium_checker() -> None:
-    check_env(BrogueEnv(backend=FakeBackend()), skip_render_check=True)
+    check_env(BrogueEnv(vector_env=FakeVectorEnv()), skip_render_check=True)
