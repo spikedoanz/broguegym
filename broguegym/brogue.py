@@ -278,6 +278,8 @@ _INVENTORY_STR_CELLS = _INVENTORY_SIZE * _INVENTORY_STR_LENGTH
 _PROGRAM_TERMINATED_INDEX = 1
 _PROGRAM_SEED_INDEX = 4
 _GYM_ZERO_BRIDGE_SEED = 0x9E3779B97F4A7C15
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+_PACKAGED_DATA_DIR = _PACKAGE_ROOT / "_native" / "bin"
 
 
 class _BridgeStepStatus(IntEnum):
@@ -367,16 +369,16 @@ _OBS_FIELD_SPECS: tuple[_ObservationField, ...] = (
 
 
 def _default_library_path() -> Path:
-    suffix = ".dylib" if sys.platform == "darwin" else ".so"
-    return _repo_root() / "BrogueCE" / "bin" / f"libbruhogue_brogue{suffix}"
+    return _default_data_dir() / _bridge_library_name()
 
 
 def _default_data_dir() -> Path:
-    return _repo_root() / "BrogueCE" / "bin"
+    return _PACKAGED_DATA_DIR
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+def _bridge_library_name() -> str:
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    return f"libbruhogue_brogue{suffix}"
 
 
 def _configure_library(library: Any) -> None:

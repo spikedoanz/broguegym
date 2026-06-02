@@ -22,8 +22,13 @@ dev = [
 
 [build-system]
 requires = ["hatchling", "editables"]
-build-backend = "build"
-backend-path = ["."]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["broguegym"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "build.py"
 
 [tool.uv]
 package = true

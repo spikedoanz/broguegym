@@ -5,7 +5,15 @@ Gymnasium environment for [Brogue CE](https://github.com/tmewett/BrogueCE).
 ## Install
 
 ```bash
+git clone --recurse-submodules git@github.com:spikedoanz/broguegym.git
+cd broguegym
 uv sync
+```
+
+If you already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ## Usage
