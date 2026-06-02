@@ -280,7 +280,6 @@ _PROGRAM_SEED_INDEX = 4
 _GYM_ZERO_BRIDGE_SEED = 0x9E3779B97F4A7C15
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _PACKAGED_DATA_DIR = _PACKAGE_ROOT / "_native" / "bin"
-_SOURCE_DATA_DIR = _PACKAGE_ROOT.parent / "BrogueCE" / "bin"
 
 
 class _BridgeStepStatus(IntEnum):
@@ -374,9 +373,7 @@ def _default_library_path() -> Path:
 
 
 def _default_data_dir() -> Path:
-    if (_PACKAGED_DATA_DIR / _bridge_library_name()).is_file():
-        return _PACKAGED_DATA_DIR
-    return _SOURCE_DATA_DIR
+    return _PACKAGED_DATA_DIR
 
 
 def _bridge_library_name() -> str:
@@ -870,15 +867,15 @@ class BrogueBackend:
         self.close()
 
     def _init_workers(self) -> None:
-        if not self.data_dir.is_dir():
-            msg = f"Brogue data directory does not exist: {self.data_dir}"
-            raise BackendUnavailableError(BackendErrorCode.BRIDGE_DATA_DIR_INVALID, msg)
         if not self.library_path.is_file():
             msg = (
                 f"Brogue bridge library does not exist: {self.library_path}. "
                 "Run through `uv run` from the project root so package sync builds it."
             )
             raise BackendUnavailableError(BackendErrorCode.BRIDGE_LIBRARY_MISSING, msg)
+        if not self.data_dir.is_dir():
+            msg = f"Brogue data directory does not exist: {self.data_dir}"
+            raise BackendUnavailableError(BackendErrorCode.BRIDGE_DATA_DIR_INVALID, msg)
 
         shared_memory = SharedMemory(create=True, size=self.num_envs * self._obs_size)
         self._shared_memory = shared_memory
