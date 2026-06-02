@@ -367,12 +367,31 @@ _OBS_FIELD_SPECS: tuple[_ObservationField, ...] = (
 
 
 def _default_library_path() -> Path:
-    suffix = ".dylib" if sys.platform == "darwin" else ".so"
-    return _repo_root() / "BrogueCE" / "bin" / f"libbruhogue_brogue{suffix}"
+    return _default_data_dir() / _bridge_library_name()
 
 
 def _default_data_dir() -> Path:
+    packaged_data_dir = _packaged_data_dir()
+    if (packaged_data_dir / _bridge_library_name()).is_file():
+        return packaged_data_dir
+    return _source_data_dir()
+
+
+def _bridge_library_name() -> str:
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    return f"libbruhogue_brogue{suffix}"
+
+
+def _source_data_dir() -> Path:
     return _repo_root() / "BrogueCE" / "bin"
+
+
+def _packaged_data_dir() -> Path:
+    return _package_root() / "_native" / "bin"
+
+
+def _package_root() -> Path:
+    return Path(__file__).resolve().parent
 
 
 def _repo_root() -> Path:
@@ -865,15 +884,15 @@ class BrogueBackend:
         self.close()
 
     def _init_workers(self) -> None:
+        if not self.data_dir.is_dir():
+            msg = f"Brogue data directory does not exist: {self.data_dir}"
+            raise BackendUnavailableError(BackendErrorCode.BRIDGE_DATA_DIR_INVALID, msg)
         if not self.library_path.is_file():
             msg = (
                 f"Brogue bridge library does not exist: {self.library_path}. "
                 "Run through `uv run` from the project root so package sync builds it."
             )
             raise BackendUnavailableError(BackendErrorCode.BRIDGE_LIBRARY_MISSING, msg)
-        if not self.data_dir.is_dir():
-            msg = f"Brogue data directory does not exist: {self.data_dir}"
-            raise BackendUnavailableError(BackendErrorCode.BRIDGE_DATA_DIR_INVALID, msg)
 
         shared_memory = SharedMemory(create=True, size=self.num_envs * self._obs_size)
         self._shared_memory = shared_memory

@@ -19,6 +19,8 @@ from broguegym.brogue import (
     BackendInfoKey,
     BackendReset,
     BackendUnavailableError,
+    _bridge_library_name,
+    _default_data_dir,
     _default_library_path,
 )
 from broguegym.brogue import BrogueBackend
@@ -303,6 +305,36 @@ def test_brogue_backend_reports_missing_bridge_library(
         BrogueBackend(1)
 
     assert exc_info.value.code is BackendErrorCode.BRIDGE_LIBRARY_MISSING
+
+
+def test_default_runtime_paths_prefer_packaged_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "site-packages" / "broguegym"
+    packaged_bin = package_root / "_native" / "bin"
+    packaged_bin.mkdir(parents=True)
+    bridge_library = packaged_bin / _bridge_library_name()
+    bridge_library.touch()
+    source_root = tmp_path / "source"
+    monkeypatch.setattr(brogue_backend_module, "_package_root", lambda: package_root)
+    monkeypatch.setattr(brogue_backend_module, "_repo_root", lambda: source_root)
+
+    assert _default_data_dir() == packaged_bin
+    assert _default_library_path() == bridge_library
+
+
+def test_default_runtime_paths_fall_back_to_source_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "site-packages" / "broguegym"
+    source_root = tmp_path / "source"
+    monkeypatch.setattr(brogue_backend_module, "_package_root", lambda: package_root)
+    monkeypatch.setattr(brogue_backend_module, "_repo_root", lambda: source_root)
+
+    assert _default_data_dir() == source_root / "BrogueCE" / "bin"
+    assert _default_library_path() == source_root / "BrogueCE" / "bin" / _bridge_library_name()
 
 
 def test_brogue_backend_reports_missing_data_dir_if_built(

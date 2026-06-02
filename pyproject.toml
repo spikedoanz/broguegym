@@ -25,11 +25,18 @@ requires = ["hatchling", "editables"]
 build-backend = "build"
 backend-path = ["."]
 
+[tool.hatch.build.targets.wheel]
+packages = ["broguegym"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
 [tool.uv]
 package = true
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "build.py" },
+    { file = "hatch_build.py" },
     { file = "BrogueCE/Makefile" },
     { file = "BrogueCE/config.mk" },
     { file = "BrogueCE/make/**/*.mk" },
