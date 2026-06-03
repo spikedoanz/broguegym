@@ -1,4 +1,4 @@
-"""Compatibility wrapper for the packaged terminal frontend."""
+"""Run the terminal frontend with `python -m broguegym`."""
 
 from __future__ import annotations
 
