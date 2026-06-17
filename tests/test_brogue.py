@@ -163,6 +163,42 @@ def test_brogue_backend_close_terminates_and_kills_unresponsive_worker() -> None
     assert backend._states == [brogue_backend_module.BackendSessionState.CLOSED]
 
 
+def test_default_data_dir_prefers_packaged_native_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged_dir = tmp_path / "packaged" / "bin"
+    source_dir = tmp_path / "BrogueCE" / "bin"
+    packaged_dir.mkdir(parents=True)
+    source_dir.mkdir(parents=True)
+    (packaged_dir / brogue_backend_module._bridge_library_name()).touch()
+    (source_dir / brogue_backend_module._bridge_library_name()).touch()
+    monkeypatch.setattr(brogue_backend_module, "_PACKAGED_DATA_DIR", packaged_dir)
+    monkeypatch.setattr(brogue_backend_module, "_SOURCE_DATA_DIR", source_dir)
+
+    assert brogue_backend_module._default_data_dir() == packaged_dir
+    assert brogue_backend_module._default_library_path() == (
+        packaged_dir / brogue_backend_module._bridge_library_name()
+    )
+
+
+def test_default_data_dir_falls_back_to_source_native_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged_dir = tmp_path / "packaged" / "bin"
+    source_dir = tmp_path / "BrogueCE" / "bin"
+    source_dir.mkdir(parents=True)
+    (source_dir / brogue_backend_module._bridge_library_name()).touch()
+    monkeypatch.setattr(brogue_backend_module, "_PACKAGED_DATA_DIR", packaged_dir)
+    monkeypatch.setattr(brogue_backend_module, "_SOURCE_DATA_DIR", source_dir)
+
+    assert brogue_backend_module._default_data_dir() == source_dir
+    assert brogue_backend_module._default_library_path() == (
+        source_dir / brogue_backend_module._bridge_library_name()
+    )
+
+
 def test_brogue_backend_reset_many_drains_peer_responses_after_worker_error() -> None:
     backend, connections = _backend_with_queued_workers(
         [
@@ -310,8 +346,10 @@ def test_brogue_backend_reports_missing_data_dir_if_built(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _skip_if_no_library()
+    library_path = brogue_backend_module._default_library_path()
     missing_data_dir = tmp_path / "no-such-dir"
     monkeypatch.setattr(brogue_backend_module, "_default_data_dir", lambda: missing_data_dir)
+    monkeypatch.setattr(brogue_backend_module, "_default_library_path", lambda: library_path)
 
     with pytest.raises(BackendUnavailableError, match="data directory") as exc_info:
         BrogueBackend(1)

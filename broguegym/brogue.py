@@ -280,6 +280,7 @@ _PROGRAM_SEED_INDEX = 4
 _GYM_ZERO_BRIDGE_SEED = 0x9E3779B97F4A7C15
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _PACKAGED_DATA_DIR = _PACKAGE_ROOT / "_native" / "bin"
+_SOURCE_DATA_DIR = _PACKAGE_ROOT.parent / "BrogueCE" / "bin"
 
 
 class _BridgeStepStatus(IntEnum):
@@ -373,6 +374,12 @@ def _default_library_path() -> Path:
 
 
 def _default_data_dir() -> Path:
+    packaged_library = _PACKAGED_DATA_DIR / _bridge_library_name()
+    if packaged_library.is_file():
+        return _PACKAGED_DATA_DIR
+    source_library = _SOURCE_DATA_DIR / _bridge_library_name()
+    if source_library.is_file():
+        return _SOURCE_DATA_DIR
     return _PACKAGED_DATA_DIR
 
 
