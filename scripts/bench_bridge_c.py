@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import platform
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from broguegym.brogue import (
@@ -69,12 +71,34 @@ typedef struct expected_abi {
     size_t program_state_offset;
 } expected_abi;
 
+typedef struct workload_profile {
+    const char *name;
+    int copy_count;
+    int invalid_steps;
+    int invalid_warmup;
+    int rest_steps;
+    int rest_warmup;
+    int search_steps;
+    int search_warmup;
+    int explore_steps;
+    int explore_warmup;
+    int fast_explore_steps;
+    int fast_explore_warmup;
+    int reset_count;
+} workload_profile;
+
 typedef struct trial_result {
     int steps;
     double elapsed;
     int terminated;
     int invalid;
 } trial_result;
+
+static const workload_profile WORKLOAD_PROFILES[] = {
+    {"smoke", 200, 200, 20, 50, 10, 50, 10, 10, 2, 10, 2, 2},
+    {"standard", 20000, 20000, 1000, 5000, 200, 5000, 200, 1000, 50, 1000, 50, 200},
+    {"long", 100000, 100000, 2000, 20000, 500, 20000, 500, 5000, 200, 5000, 200, 1000},
+};
 
 static volatile unsigned int copy_checksum_sink = 0;
 
@@ -98,11 +122,6 @@ static void *must_symbol(void *handle, const char *name) {
     return symbol;
 }
 
-static int scaled_count(int base, int percent) {
-    long count = ((long) base * (long) percent + 99L) / 100L;
-    return count < 1L ? 1 : (int) count;
-}
-
 static int double_compare(const void *left, const void *right) {
     double a = *(const double *) left;
     double b = *(const double *) right;
@@ -122,7 +141,10 @@ static double median_sample(const double *sorted, int count) {
     return (sorted[count / 2 - 1] + sorted[count / 2]) / 2.0;
 }
 
-static double p95_sample(const double *sorted, int count) {
+static double tail_sample(const double *sorted, int count) {
+    if (count < 20) {
+        return sorted[count - 1];
+    }
     int index = (95 * count + 99) / 100 - 1;
     if (index < 0) {
         index = 0;
@@ -154,6 +176,17 @@ static int parse_int_arg(const char *name, const char *value) {
 
 static size_t parse_size_arg(const char *name, const char *value) {
     return (size_t) parse_u64_arg(name, value);
+}
+
+static const workload_profile *find_profile(const char *name) {
+    size_t count = sizeof(WORKLOAD_PROFILES) / sizeof(WORKLOAD_PROFILES[0]);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(WORKLOAD_PROFILES[i].name, name) == 0) {
+            return &WORKLOAD_PROFILES[i];
+        }
+    }
+    fprintf(stderr, "unknown profile %s; expected smoke, standard, or long\n", name);
+    exit(2);
 }
 
 static void validate_bridge_abi(const bridge_api *api, const expected_abi *expected) {
@@ -281,44 +314,48 @@ static trial_result run_step_trial(const bridge_api *api,
     return result;
 }
 
-static void summarize_step_case(const char *label,
-                                int target_steps,
-                                int repeats,
-                                const trial_result *results) {
-    double *samples = (double *) calloc((size_t) repeats, sizeof(double));
+static void summarize_case(const char *label,
+                           int target_steps,
+                           int seed_count,
+                           int trace_repeats,
+                           int sample_count,
+                           const trial_result *results) {
+    double *samples = (double *) calloc((size_t) sample_count, sizeof(double));
     if (samples == NULL) {
         perror("calloc samples");
         exit(2);
     }
 
     int completed_steps = 0;
-    int terminated_repeats = 0;
+    int terminated_trials = 0;
     int invalid = 0;
-    for (int i = 0; i < repeats; i++) {
+    for (int i = 0; i < sample_count; i++) {
         if (results[i].steps < 1) {
-            fprintf(stderr, "%s repeat %d completed no steps\n", label, i);
+            fprintf(stderr, "%s trial %d completed no steps\n", label, i);
             exit(2);
         }
         samples[i] = results[i].elapsed * 1000000.0 / (double) results[i].steps;
         completed_steps += results[i].steps;
-        terminated_repeats += results[i].terminated;
+        terminated_trials += results[i].terminated;
         invalid += results[i].invalid;
     }
-    qsort(samples, (size_t) repeats, sizeof(double), double_compare);
+    qsort(samples, (size_t) sample_count, sizeof(double), double_compare);
 
     double min_us = samples[0];
-    double median_us = median_sample(samples, repeats);
-    double p95_us = p95_sample(samples, repeats);
-    printf("%-14s  %8d  %7d  %8.2f  %8.2f  %8.2f  %10.0f  %6d  %7d  %7d\n",
+    double median_us = median_sample(samples, sample_count);
+    double tail_us = tail_sample(samples, sample_count);
+    printf("%-14s  %8d  %5d  %7d  %7d  %8.2f  %8.2f  %8.2f  %10.0f  %7d  %5d  %7d\n",
            label,
            target_steps,
-           repeats,
+           seed_count,
+           trace_repeats,
+           sample_count,
            median_us,
            min_us,
-           p95_us,
+           tail_us,
            1000000.0 / median_us,
            completed_steps,
-           terminated_repeats,
+           terminated_trials,
            invalid);
     free(samples);
 }
@@ -328,15 +365,16 @@ static void benchmark_steps(const bridge_api *api,
                             long key,
                             int control,
                             int shift,
-                            int base_steps,
+                            int target_steps,
                             int warmup,
-                            int percent,
-                            int repeats,
-                            uint64_t seed,
+                            int trace_repeats,
+                            int seed_count,
+                            uint64_t seed_start,
+                            uint64_t case_seed,
                             void *observation,
                             size_t program_state_offset) {
-    int target_steps = scaled_count(base_steps, percent);
-    trial_result *results = (trial_result *) calloc((size_t) repeats, sizeof(trial_result));
+    int sample_count = trace_repeats * seed_count;
+    trial_result *results = (trial_result *) calloc((size_t) sample_count, sizeof(trial_result));
     if (results == NULL) {
         perror("calloc results");
         exit(2);
@@ -348,76 +386,69 @@ static void benchmark_steps(const bridge_api *api,
                           control,
                           shift,
                           warmup,
-                          seed ^ 0x9e3779b97f4a7c15ULL,
+                          (case_seed + seed_start) ^ 0x9e3779b97f4a7c15ULL,
                           observation,
                           program_state_offset);
 
-    for (int repeat = 0; repeat < repeats; repeat++) {
-        results[repeat] = run_step_trial(api,
-                                         label,
-                                         key,
-                                         control,
-                                         shift,
-                                         target_steps,
-                                         seed,
-                                         observation,
-                                         program_state_offset);
+    int result_index = 0;
+    for (int seed_index = 0; seed_index < seed_count; seed_index++) {
+        uint64_t seed = case_seed + seed_start + (uint64_t) seed_index;
+        for (int repeat = 0; repeat < trace_repeats; repeat++) {
+            results[result_index++] = run_step_trial(api,
+                                                     label,
+                                                     key,
+                                                     control,
+                                                     shift,
+                                                     target_steps,
+                                                     seed,
+                                                     observation,
+                                                     program_state_offset);
+        }
     }
-    summarize_step_case(label, target_steps, repeats, results);
+    summarize_case(label, target_steps, seed_count, trace_repeats, sample_count, results);
     free(results);
 }
 
 static void benchmark_resets(const bridge_api *api,
-                             int base_resets,
-                             int percent,
-                             int repeats,
-                             uint64_t seed,
+                             int target_resets,
+                             int trace_repeats,
+                             int seed_count,
+                             uint64_t seed_start,
                              void *observation) {
-    int target_resets = scaled_count(base_resets, percent);
-    double *samples = (double *) calloc((size_t) repeats, sizeof(double));
-    if (samples == NULL) {
-        perror("calloc reset samples");
+    int sample_count = trace_repeats * seed_count;
+    trial_result *results = (trial_result *) calloc((size_t) sample_count, sizeof(trial_result));
+    if (results == NULL) {
+        perror("calloc reset results");
         exit(2);
     }
 
-    for (int repeat = 0; repeat < repeats; repeat++) {
-        double start = now_seconds();
-        for (int i = 0; i < target_resets; i++) {
-            int rc = api->reset(seed + (uint64_t) i, observation);
-            if (rc != 0) {
-                fprintf(stderr, "reset bench failed at %d: %s\n", i, api->last_error());
-                exit(2);
+    int result_index = 0;
+    for (int seed_index = 0; seed_index < seed_count; seed_index++) {
+        for (int repeat = 0; repeat < trace_repeats; repeat++) {
+            trial_result result = {target_resets, 0.0, 0, 0};
+            uint64_t seed_base = seed_start + 5001ULL + (uint64_t) seed_index * 1000003ULL;
+            double start = now_seconds();
+            for (int i = 0; i < target_resets; i++) {
+                int rc = api->reset(seed_base + (uint64_t) i, observation);
+                if (rc != 0) {
+                    fprintf(stderr, "reset bench failed at %d: %s\n", i, api->last_error());
+                    exit(2);
+                }
             }
+            result.elapsed = now_seconds() - start;
+            api->close();
+            results[result_index++] = result;
         }
-        double elapsed = now_seconds() - start;
-        samples[repeat] = elapsed * 1000000.0 / (double) target_resets;
-        api->close();
     }
-
-    qsort(samples, (size_t) repeats, sizeof(double), double_compare);
-    double min_us = samples[0];
-    double median_us = median_sample(samples, repeats);
-    double p95_us = p95_sample(samples, repeats);
-    printf("%-14s  %8d  %7d  %8.2f  %8.2f  %8.2f  %10.0f  %6d  %7d  %7d\n",
-           "reset",
-           target_resets,
-           repeats,
-           median_us,
-           min_us,
-           p95_us,
-           1000000.0 / median_us,
-           target_resets * repeats,
-           0,
-           0);
-    free(samples);
+    summarize_case("reset", target_resets, seed_count, trace_repeats, sample_count, results);
+    free(results);
 }
 
-static void benchmark_copy_only(size_t observation_size, int percent, int repeats) {
-    int target_copies = scaled_count(20000, percent);
+static void benchmark_copy_only(size_t observation_size, int target_copies, int trace_repeats) {
     unsigned char *source = (unsigned char *) malloc(observation_size);
     unsigned char *dest = (unsigned char *) malloc(observation_size);
-    double *samples = (double *) calloc((size_t) repeats, sizeof(double));
-    if (source == NULL || dest == NULL || samples == NULL) {
+    trial_result *results = (trial_result *) calloc((size_t) trace_repeats, sizeof(trial_result));
+    if (source == NULL || dest == NULL || results == NULL) {
         perror("copy-only allocation");
         exit(2);
     }
@@ -426,42 +457,28 @@ static void benchmark_copy_only(size_t observation_size, int percent, int repeat
     }
 
     volatile unsigned int checksum = 0;
-    for (int repeat = 0; repeat < repeats; repeat++) {
+    for (int repeat = 0; repeat < trace_repeats; repeat++) {
+        trial_result result = {target_copies, 0.0, 0, 0};
         double start = now_seconds();
         for (int i = 0; i < target_copies; i++) {
             memcpy(dest, source, observation_size);
             checksum += dest[((size_t) i * 97U) % observation_size];
         }
-        double elapsed = now_seconds() - start;
-        samples[repeat] = elapsed * 1000000.0 / (double) target_copies;
+        result.elapsed = now_seconds() - start;
+        results[repeat] = result;
     }
 
-    qsort(samples, (size_t) repeats, sizeof(double), double_compare);
-    double min_us = samples[0];
-    double median_us = median_sample(samples, repeats);
-    double p95_us = p95_sample(samples, repeats);
     copy_checksum_sink = checksum;
-    printf("%-14s  %8d  %7d  %8.2f  %8.2f  %8.2f  %10.0f  %6d  %7d  %7d\n",
-           "copy-only",
-           target_copies,
-           repeats,
-           median_us,
-           min_us,
-           p95_us,
-           1000000.0 / median_us,
-           target_copies * repeats,
-           0,
-           0);
-
+    summarize_case("copy-only", target_copies, 0, trace_repeats, trace_repeats, results);
     free(source);
     free(dest);
-    free(samples);
+    free(results);
 }
 
 int main(int argc, char **argv) {
-    if (argc != 14) {
+    if (argc != 16) {
         fprintf(stderr,
-                "usage: %s LIBRARY_PATH DATA_DIR PERCENT REPEATS "
+                "usage: %s LIBRARY_PATH DATA_DIR PROFILE TRACE_REPEATS SEED_COUNT SEED_START "
                 "ABI OBS_SIZE SCREEN_COLS SCREEN_ROWS MAP_COLS MAP_ROWS "
                 "INVENTORY_SIZE INVENTORY_STR_LENGTH PROGRAM_STATE_OFFSET\n",
                 argv[0]);
@@ -470,24 +487,26 @@ int main(int argc, char **argv) {
 
     const char *library_path = argv[1];
     const char *data_dir = argv[2];
-    int percent = parse_int_arg("percent", argv[3]);
-    int repeats = parse_int_arg("repeats", argv[4]);
+    const workload_profile *profile = find_profile(argv[3]);
+    int trace_repeats = parse_int_arg("trace repeats", argv[4]);
+    int seed_count = parse_int_arg("seed count", argv[5]);
+    uint64_t seed_start = parse_u64_arg("seed start", argv[6]);
     expected_abi expected;
-    expected.abi_version = (uint32_t) parse_u64_arg("expected abi", argv[5]);
-    expected.observation_size = parse_size_arg("expected observation size", argv[6]);
-    expected.screen_cols = parse_int_arg("expected screen cols", argv[7]);
-    expected.screen_rows = parse_int_arg("expected screen rows", argv[8]);
-    expected.map_cols = parse_int_arg("expected map cols", argv[9]);
-    expected.map_rows = parse_int_arg("expected map rows", argv[10]);
-    expected.inventory_size = parse_int_arg("expected inventory size", argv[11]);
-    expected.inventory_str_length = parse_int_arg("expected inventory str length", argv[12]);
-    expected.program_state_offset = parse_size_arg("program state offset", argv[13]);
-    if (percent < 1) {
-        fprintf(stderr, "percent must be at least 1\n");
+    expected.abi_version = (uint32_t) parse_u64_arg("expected abi", argv[7]);
+    expected.observation_size = parse_size_arg("expected observation size", argv[8]);
+    expected.screen_cols = parse_int_arg("expected screen cols", argv[9]);
+    expected.screen_rows = parse_int_arg("expected screen rows", argv[10]);
+    expected.map_cols = parse_int_arg("expected map cols", argv[11]);
+    expected.map_rows = parse_int_arg("expected map rows", argv[12]);
+    expected.inventory_size = parse_int_arg("expected inventory size", argv[13]);
+    expected.inventory_str_length = parse_int_arg("expected inventory str length", argv[14]);
+    expected.program_state_offset = parse_size_arg("program state offset", argv[15]);
+    if (trace_repeats < 1) {
+        fprintf(stderr, "trace repeats must be at least 1\n");
         return 2;
     }
-    if (repeats < 1) {
-        fprintf(stderr, "repeats must be at least 1\n");
+    if (seed_count < 1) {
+        fprintf(stderr, "seed count must be at least 1\n");
         return 2;
     }
 
@@ -524,30 +543,34 @@ int main(int argc, char **argv) {
     printf("library: %s\n", library_path);
     printf("data dir: %s\n", data_dir);
     printf("observation: %zu bytes\n", expected.observation_size);
-    printf("scale: %d%% measured trace length only; compare stateful cases at the same scale\n", percent);
-    printf("repeats: %d\n", repeats);
+    printf("profile: %s fixed trace lengths\n", profile->name);
+    printf("seed count: %d; trace repeats per seed: %d\n", seed_count, trace_repeats);
+    printf("tail_us is p95 for >=20 samples, otherwise max\n");
     printf("step cases include full observation fill and export\n");
+    printf("no fill-only baseline: current bridge ABI exposes no observation-export-only call\n");
     printf("\n");
-    printf("%-14s  %8s  %7s  %8s  %8s  %8s  %10s  %6s  %7s  %7s\n",
+    printf("%-14s  %8s  %5s  %7s  %7s  %8s  %8s  %8s  %10s  %7s  %5s  %7s\n",
            "case",
            "target",
+           "seeds",
            "repeats",
+           "samples",
            "med_us",
            "min_us",
-           "p95_us",
+           "tail_us",
            "med/sec",
            "done",
            "term",
            "invalid");
-    printf("------------------------------------------------------------------------------------------------\n");
+    printf("----------------------------------------------------------------------------------------------------------------\n");
 
-    benchmark_copy_only(expected.observation_size, percent, repeats);
-    benchmark_steps(&api, "invalid-key", '!', 0, 0, 20000, 1000, percent, repeats, 1, observation, expected.program_state_offset);
-    benchmark_steps(&api, "rest", 'z', 0, 0, 5000, 200, percent, repeats, 1001, observation, expected.program_state_offset);
-    benchmark_steps(&api, "search", 's', 0, 0, 5000, 200, percent, repeats, 2001, observation, expected.program_state_offset);
-    benchmark_steps(&api, "explore", 'x', 0, 0, 1000, 50, percent, repeats, 3001, observation, expected.program_state_offset);
-    benchmark_steps(&api, "fast-explore", 'x', 1, 0, 1000, 50, percent, repeats, 4001, observation, expected.program_state_offset);
-    benchmark_resets(&api, 200, percent, repeats, 5001, observation);
+    benchmark_copy_only(expected.observation_size, profile->copy_count, trace_repeats);
+    benchmark_steps(&api, "invalid-key", '!', 0, 0, profile->invalid_steps, profile->invalid_warmup, trace_repeats, seed_count, seed_start, 1, observation, expected.program_state_offset);
+    benchmark_steps(&api, "rest", 'z', 0, 0, profile->rest_steps, profile->rest_warmup, trace_repeats, seed_count, seed_start, 1001, observation, expected.program_state_offset);
+    benchmark_steps(&api, "search", 's', 0, 0, profile->search_steps, profile->search_warmup, trace_repeats, seed_count, seed_start, 2001, observation, expected.program_state_offset);
+    benchmark_steps(&api, "explore", 'x', 0, 0, profile->explore_steps, profile->explore_warmup, trace_repeats, seed_count, seed_start, 3001, observation, expected.program_state_offset);
+    benchmark_steps(&api, "fast-explore", 'x', 1, 0, profile->fast_explore_steps, profile->fast_explore_warmup, trace_repeats, seed_count, seed_start, 4001, observation, expected.program_state_offset);
+    benchmark_resets(&api, profile->reset_count, trace_repeats, seed_count, seed_start, observation);
 
     free(observation);
     dlclose(handle);
@@ -575,14 +598,81 @@ def compile_harness(cc: str, binary_path: Path) -> None:
     subprocess.run(command, input=C_SOURCE, text=True, check=True)
 
 
-def harness_args(library: Path, data_dir: Path, scale: int, repeats: int) -> list[str]:
+def command_first_line(command: list[str], *, cwd: Path | None = None) -> str:
+    """Return the first output line for a best-effort provenance command."""
+
+    try:
+        output = subprocess.check_output(
+            command,
+            cwd=cwd,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"unavailable ({exc})"
+    first_line = output.splitlines()[0] if output.splitlines() else ""
+    return first_line or "unavailable"
+
+
+def git_status(root: Path) -> str:
+    """Return a compact git status string for benchmark provenance."""
+
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--short"],
+            cwd=root,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"unknown ({exc})"
+    lines = output.splitlines()
+    if not lines:
+        return "clean"
+    return f"dirty ({len(lines)} status lines)"
+
+
+def print_provenance(cc: str, library: Path) -> None:
+    """Print run metadata that affects benchmark comparability."""
+
+    root = Path(__file__).resolve().parents[1]
+    library_stat = library.stat()
+    modified = datetime.fromtimestamp(library_stat.st_mtime).isoformat(timespec="seconds")
+    print("Benchmark provenance")
+    print(f"repo: {command_first_line(['git', 'rev-parse', '--short', 'HEAD'], cwd=root)} {git_status(root)}")
+    print(f"system: {platform.platform()} ({platform.machine()})")
+    print(f"python: {platform.python_version()}")
+    print(f"harness compiler: {cc}")
+    print(f"harness compiler version: {command_first_line([cc, '--version'])}")
+    print("harness flags: -O3 -Wall -Wextra")
+    print(f"bridge library: {library} ({library_stat.st_size} bytes, mtime {modified})")
+    print(
+        "bridge build env: "
+        f"CC={os.environ.get('CC', '')!r} "
+        f"CFLAGS={os.environ.get('CFLAGS', '')!r} "
+        f"CPPFLAGS={os.environ.get('CPPFLAGS', '')!r} "
+        f"LDLIBS={os.environ.get('LDLIBS', '')!r}",
+    )
+    print(flush=True)
+
+
+def harness_args(
+    library: Path,
+    data_dir: Path,
+    profile: str,
+    trace_repeats: int,
+    seed_count: int,
+    seed_start: int,
+) -> list[str]:
     """Return native harness arguments, including Python-side ABI expectations."""
 
     return [
         str(library),
         str(data_dir),
-        str(scale),
-        str(repeats),
+        profile,
+        str(trace_repeats),
+        str(seed_count),
+        str(seed_start),
         str(_BRIDGE_ABI_VERSION),
         str(ctypes.sizeof(_CObservation)),
         str(_SCREEN_COLS),
@@ -617,16 +707,30 @@ def main() -> None:
         help="Brogue data directory containing keymap/assets",
     )
     parser.add_argument(
-        "--scale",
-        type=int,
-        default=100,
-        help="Percentage of measured trace length to run; compare stateful cases at the same scale",
+        "--profile",
+        choices=("smoke", "standard", "long"),
+        default="standard",
+        help="Fixed workload profile to run",
     )
     parser.add_argument(
+        "--trace-repeats",
         "--repeats",
+        dest="trace_repeats",
         type=int,
         default=3,
-        help="Timed repeats per case",
+        help="Timed repeats per seed for each case",
+    )
+    parser.add_argument(
+        "--seed-count",
+        type=int,
+        default=1,
+        help="Number of consecutive seeds to measure for each stateful case",
+    )
+    parser.add_argument(
+        "--seed-start",
+        type=int,
+        default=0,
+        help="Offset added to each case's deterministic base seed",
     )
     parser.add_argument(
         "--binary",
@@ -636,11 +740,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.scale < 1:
-        msg = "--scale must be at least 1"
+    if args.trace_repeats < 1:
+        msg = "--trace-repeats must be at least 1"
         raise ValueError(msg)
-    if args.repeats < 1:
-        msg = "--repeats must be at least 1"
+    if args.seed_count < 1:
+        msg = "--seed-count must be at least 1"
+        raise ValueError(msg)
+    if args.seed_start < 0:
+        msg = "--seed-start must be non-negative"
         raise ValueError(msg)
     if not args.library.is_file():
         msg = f"Brogue bridge library does not exist: {args.library}"
@@ -652,8 +759,19 @@ def main() -> None:
     if args.binary is not None:
         binary_path = args.binary
         compile_harness(args.cc, binary_path)
+        print_provenance(args.cc, args.library)
         subprocess.run(
-            [str(binary_path), *harness_args(args.library, args.data_dir, args.scale, args.repeats)],
+            [
+                str(binary_path),
+                *harness_args(
+                    args.library,
+                    args.data_dir,
+                    args.profile,
+                    args.trace_repeats,
+                    args.seed_count,
+                    args.seed_start,
+                ),
+            ],
             check=True,
         )
         return
@@ -661,8 +779,19 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="broguegym-bridge-bench-") as temp_dir:
         binary_path = Path(temp_dir) / "bench_bridge_c"
         compile_harness(args.cc, binary_path)
+        print_provenance(args.cc, args.library)
         subprocess.run(
-            [str(binary_path), *harness_args(args.library, args.data_dir, args.scale, args.repeats)],
+            [
+                str(binary_path),
+                *harness_args(
+                    args.library,
+                    args.data_dir,
+                    args.profile,
+                    args.trace_repeats,
+                    args.seed_count,
+                    args.seed_start,
+                ),
+            ],
             check=True,
         )
 
