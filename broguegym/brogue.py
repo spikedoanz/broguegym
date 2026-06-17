@@ -107,11 +107,26 @@ class _InProcessBrogue:
     serialize access externally.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        output_buffers: ObservationDict | None = None,
+        observation_mask: int | None = None,
+    ) -> None:
         self.library_path = _default_library_path()
         self.data_dir = _default_data_dir()
         self._library: Any | None = None
         self._state = BackendSessionState.CLOSED
+        self._output_buffers = output_buffers
+        self._observation_mask = (
+            _BRIDGE_OBSERVATION_MASK_FULL if observation_mask is None else observation_mask
+        )
+        if self._observation_mask & _BRIDGE_OBSERVATION_MASK_SCREEN == 0:
+            msg = "Brogue backend requires the screen observation mask for program_state"
+            raise ValueError(msg)
+        self._registered_buffers: _CObservationBuffers | None = None
+        self._registered_buffer_refs: list[Any] = []
+        self._uses_registered_buffers = False
 
     def reset(
         self,
@@ -124,17 +139,24 @@ class _InProcessBrogue:
         self._validate_data_dir()
         if self._state is BackendSessionState.RUNNING:
             self.close()
-        observation = _CObservation()
         library = self._load_library()
+        uses_registered_buffers = self._register_output_buffers(library)
         library.brh_set_data_dir(str(self.data_dir).encode("utf-8"))
-        rc = library.brh_reset(seed_value, ctypes.byref(observation))
+        if uses_registered_buffers:
+            rc = library.brh_reset_registered(seed_value)
+            observation_dict = self._require_output_buffers()
+        else:
+            observation = _CObservation()
+            rc = library.brh_reset(seed_value, ctypes.byref(observation))
+            observation_dict = _observation_from_c(observation)
         try:
             self._raise_if_failed(rc, "reset")
         except BackendUnavailableError:
             self._state = BackendSessionState.CLOSED
+            if uses_registered_buffers:
+                self.close()
             raise
         self._state = BackendSessionState.RUNNING
-        observation_dict = _observation_from_c(observation)
         actual_seed = int(observation_dict["program_state"][_PROGRAM_SEED_INDEX])
         return BackendReset(
             observation=observation_dict,
@@ -157,18 +179,26 @@ class _InProcessBrogue:
             raise BackendUnavailableError(BackendErrorCode.BRIDGE_NOT_RUNNING, msg)
 
         key = _bridge_key(brogue_input.key)
-        observation = _CObservation()
         library = self._require_library()
-        rc = library.brh_step(
-            key,
-            int(brogue_input.control),
-            int(brogue_input.shift),
-            ctypes.byref(observation),
-        )
+        if self._uses_registered_buffers:
+            rc = library.brh_step_registered(
+                key,
+                int(brogue_input.control),
+                int(brogue_input.shift),
+            )
+            observation_dict = self._require_output_buffers()
+        else:
+            observation = _CObservation()
+            rc = library.brh_step(
+                key,
+                int(brogue_input.control),
+                int(brogue_input.shift),
+                ctypes.byref(observation),
+            )
+            observation_dict = _observation_from_c(observation)
         if rc < 0:
             self._raise_if_failed(rc, "step")
         status = _bridge_step_status(rc)
-        observation_dict = _observation_from_c(observation)
         terminated = bool(observation_dict["program_state"][_PROGRAM_TERMINATED_INDEX])
         info: InfoDict = {
             BackendInfoKey.KEY: brogue_input.key,
@@ -203,9 +233,24 @@ class _InProcessBrogue:
     def close(self) -> None:
         """Stop the current Brogue session, if one is running."""
 
+        library = self._library
         if self._state is BackendSessionState.RUNNING:
-            self._require_library().brh_close()
+            library = self._require_library()
+            library.brh_close()
             self._state = BackendSessionState.CLOSED
+        if (
+            library is not None
+            and self._uses_registered_buffers
+            and _library_supports_registered_buffers(library)
+        ):
+            library.brh_clear_observation_buffers()
+        self._uses_registered_buffers = False
+
+    @property
+    def uses_registered_buffers(self) -> bool:
+        """Whether the active session is writing directly into registered buffers."""
+
+        return self._uses_registered_buffers
 
     def __enter__(self) -> _InProcessBrogue:
         return self
@@ -243,6 +288,40 @@ class _InProcessBrogue:
             raise RuntimeError(msg)
         return self._library
 
+    def _require_output_buffers(self) -> ObservationDict:
+        if self._output_buffers is None:
+            msg = "registered observation buffers are not configured"
+            raise RuntimeError(msg)
+        return self._output_buffers
+
+    def _register_output_buffers(self, library: Any) -> bool:
+        if self._output_buffers is None:
+            self._uses_registered_buffers = False
+            return False
+        if not _library_supports_registered_buffers(library):
+            self._uses_registered_buffers = False
+            return False
+        if self._registered_buffers is None:
+            self._registered_buffers, self._registered_buffer_refs = _observation_buffers_from_arrays(
+                self._output_buffers,
+            )
+        supported_mask = int(library.brh_supported_observation_mask())
+        if self._observation_mask & ~supported_mask:
+            msg = (
+                "Brogue bridge does not support observation mask "
+                f"{self._observation_mask:#x}; supported={supported_mask:#x}"
+            )
+            raise BackendUnavailableError(BackendErrorCode.BRIDGE_ABI_MISMATCH, msg)
+        rc = library.brh_register_observation_buffers(
+            ctypes.byref(self._registered_buffers),
+            self._observation_mask,
+        )
+        if rc != 0:
+            self._uses_registered_buffers = False
+            self._raise_if_failed(rc, "register observation buffers")
+        self._uses_registered_buffers = True
+        return True
+
     def _validate_data_dir(self) -> None:
         if not self.data_dir.is_dir():
             msg = f"Brogue data directory does not exist: {self.data_dir}"
@@ -258,7 +337,15 @@ class _InProcessBrogue:
         raise BackendUnavailableError(BackendErrorCode.BRIDGE_OPERATION_FAILED, msg)
 
 
-_BRIDGE_ABI_VERSION = 7
+_BRIDGE_ABI_VERSION = 8
+_BRIDGE_OBSERVATION_MASK_SCREEN = 1 << 0
+_BRIDGE_OBSERVATION_MASK_SEMANTIC_VISIBLE = 1 << 1
+_BRIDGE_OBSERVATION_MASK_INVENTORY = 1 << 2
+_BRIDGE_OBSERVATION_MASK_FULL = (
+    _BRIDGE_OBSERVATION_MASK_SCREEN
+    | _BRIDGE_OBSERVATION_MASK_SEMANTIC_VISIBLE
+    | _BRIDGE_OBSERVATION_MASK_INVENTORY
+)
 _SCREEN_COLS = 100
 _SCREEN_ROWS = 34
 _MAP_COLS = 79
@@ -325,6 +412,51 @@ class _CObservation(ctypes.Structure):
     ]
 
 
+_CInt16Pointer = ctypes.POINTER(ctypes.c_int16)
+_CUInt32Pointer = ctypes.POINTER(ctypes.c_uint32)
+_CUInt8Pointer = ctypes.POINTER(ctypes.c_uint8)
+_CUInt16Pointer = ctypes.POINTER(ctypes.c_uint16)
+_CUInt64Pointer = ctypes.POINTER(ctypes.c_uint64)
+_CInt64Pointer = ctypes.POINTER(ctypes.c_int64)
+
+
+class _CObservationBuffers(ctypes.Structure):
+    _fields_ = [
+        ("glyphs", _CInt16Pointer),
+        ("chars", _CUInt32Pointer),
+        ("colors_fg", _CUInt8Pointer),
+        ("colors_bg", _CUInt8Pointer),
+        ("specials", _CUInt8Pointer),
+        ("map_layers", _CUInt16Pointer),
+        ("map_flags", _CUInt64Pointer),
+        ("map_volume", _CUInt16Pointer),
+        ("map_machine", _CUInt8Pointer),
+        ("map_light", _CInt16Pointer),
+        ("map_has_item", _CUInt8Pointer),
+        ("map_item_category", _CUInt16Pointer),
+        ("map_item_kind", _CInt16Pointer),
+        ("map_item_quantity", _CInt16Pointer),
+        ("map_item_flags", _CUInt64Pointer),
+        ("map_has_monster", _CUInt8Pointer),
+        ("map_monster_kind", _CInt16Pointer),
+        ("map_monster_hp", _CInt16Pointer),
+        ("map_monster_state", _CInt16Pointer),
+        ("inventory_present", _CUInt8Pointer),
+        ("inventory_letters", _CUInt8Pointer),
+        ("inventory_strs", _CUInt8Pointer),
+        ("inventory_category", _CUInt16Pointer),
+        ("inventory_kind", _CInt16Pointer),
+        ("inventory_quantity", _CInt16Pointer),
+        ("inventory_flags", _CUInt64Pointer),
+        ("inventory_enchant1", _CInt16Pointer),
+        ("inventory_enchant2", _CInt16Pointer),
+        ("inventory_charges", _CInt16Pointer),
+        ("blstats", _CInt64Pointer),
+        ("message", _CUInt8Pointer),
+        ("program_state", _CUInt64Pointer),
+    ]
+
+
 class _ObservationField(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     name: str
     dtype: Any
@@ -367,6 +499,42 @@ _OBS_FIELD_SPECS: tuple[_ObservationField, ...] = (
     _ObservationField(name="message", dtype=np.uint8, shape=(_MESSAGE_SIZE,)),
     _ObservationField(name="program_state", dtype=np.uint64, shape=(_PROGRAM_STATE_SIZE,)),
 )
+
+
+_OBS_POINTER_TYPES: dict[str, Any] = {
+    "glyphs": _CInt16Pointer,
+    "chars": _CUInt32Pointer,
+    "colors_fg": _CUInt8Pointer,
+    "colors_bg": _CUInt8Pointer,
+    "specials": _CUInt8Pointer,
+    "map_layers": _CUInt16Pointer,
+    "map_flags": _CUInt64Pointer,
+    "map_volume": _CUInt16Pointer,
+    "map_machine": _CUInt8Pointer,
+    "map_light": _CInt16Pointer,
+    "map_has_item": _CUInt8Pointer,
+    "map_item_category": _CUInt16Pointer,
+    "map_item_kind": _CInt16Pointer,
+    "map_item_quantity": _CInt16Pointer,
+    "map_item_flags": _CUInt64Pointer,
+    "map_has_monster": _CUInt8Pointer,
+    "map_monster_kind": _CInt16Pointer,
+    "map_monster_hp": _CInt16Pointer,
+    "map_monster_state": _CInt16Pointer,
+    "inventory_present": _CUInt8Pointer,
+    "inventory_letters": _CUInt8Pointer,
+    "inventory_strs": _CUInt8Pointer,
+    "inventory_category": _CUInt16Pointer,
+    "inventory_kind": _CInt16Pointer,
+    "inventory_quantity": _CInt16Pointer,
+    "inventory_flags": _CUInt64Pointer,
+    "inventory_enchant1": _CInt16Pointer,
+    "inventory_enchant2": _CInt16Pointer,
+    "inventory_charges": _CInt16Pointer,
+    "blstats": _CInt64Pointer,
+    "message": _CUInt8Pointer,
+    "program_state": _CUInt64Pointer,
+}
 
 
 def _default_library_path() -> Path:
@@ -420,6 +588,32 @@ def _configure_library(library: Any) -> None:
     library.brh_set_data_dir.restype = None
     library.brh_last_error.argtypes = []
     library.brh_last_error.restype = ctypes.c_char_p
+    try:
+        library.brh_supported_observation_mask.argtypes = []
+        library.brh_supported_observation_mask.restype = ctypes.c_uint64
+        library.brh_register_observation_buffers.argtypes = [
+            ctypes.POINTER(_CObservationBuffers),
+            ctypes.c_uint64,
+        ]
+        library.brh_register_observation_buffers.restype = ctypes.c_int
+        library.brh_clear_observation_buffers.argtypes = []
+        library.brh_clear_observation_buffers.restype = None
+        library.brh_reset_registered.argtypes = [ctypes.c_uint64]
+        library.brh_reset_registered.restype = ctypes.c_int
+        library.brh_step_registered.argtypes = [
+            ctypes.c_long,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        library.brh_step_registered.restype = ctypes.c_int
+    except AttributeError:
+        library._brh_registered_buffers_available = False
+    else:
+        library._brh_registered_buffers_available = True
+
+
+def _library_supports_registered_buffers(library: Any) -> bool:
+    return bool(getattr(library, "_brh_registered_buffers_available", False))
 
 
 def _validate_bridge_abi(library: Any) -> None:
@@ -465,6 +659,35 @@ def _observation_from_c(observation: _CObservation) -> ObservationDict:
 def _copy_array(source: Any, shape: tuple[int, ...]) -> NDArray[np.generic]:
     array = np.ctypeslib.as_array(source).copy()
     return cast(NDArray[np.generic], array.reshape(shape))
+
+
+def _observation_buffers_from_arrays(
+    buffers: ObservationDict,
+) -> tuple[_CObservationBuffers, list[Any]]:
+    registered = _CObservationBuffers()
+    refs: list[Any] = []
+    for field in _OBS_FIELD_SPECS:
+        if field.name not in buffers:
+            msg = f"missing observation buffer {field.name!r}"
+            raise KeyError(msg)
+        array = buffers[field.name]
+        expected_dtype = np.dtype(field.dtype)
+        if array.shape != field.shape:
+            msg = f"observation buffer {field.name!r} has shape {array.shape}, expected {field.shape}"
+            raise ValueError(msg)
+        if array.dtype != expected_dtype:
+            msg = (
+                f"observation buffer {field.name!r} has dtype {array.dtype}, "
+                f"expected {expected_dtype}"
+            )
+            raise TypeError(msg)
+        if not array.flags.c_contiguous:
+            msg = f"observation buffer {field.name!r} must be C-contiguous"
+            raise ValueError(msg)
+        pointer = cast(Any, array).ctypes.data_as(_OBS_POINTER_TYPES[field.name])
+        setattr(registered, field.name, pointer)
+        refs.append(pointer)
+    return registered, refs
 
 
 def _allocate_observation_buffers() -> ObservationDict:  # pyright: ignore[reportUnusedFunction]
@@ -598,7 +821,7 @@ def _owned_observation(source: ObservationDict) -> ObservationDict:
 def _process_worker_main(connection: Connection, shm_name: str, env_id: int) -> None:
     shared_memory = SharedMemory(name=shm_name)
     observation = _single_observation_view(shared_memory.buf, env_id)
-    backend = _InProcessBrogue()
+    backend = _InProcessBrogue(output_buffers=observation)
     try:
         while True:
             command = cast(tuple[Any, ...], connection.recv())
@@ -610,13 +833,15 @@ def _process_worker_main(connection: Connection, shm_name: str, env_id: int) -> 
                 if operation == "reset":
                     seed = cast(int, command[1])
                     result = backend.reset(seed=seed)
-                    _copy_observation(result.observation, observation)
+                    if not backend.uses_registered_buffers:
+                        _copy_observation(result.observation, observation)
                     connection.send(("reset", result.info))
                     continue
                 if operation == "step":
                     action = cast(Action, command[1])
                     result = backend.step(action)
-                    _copy_observation(result.observation, observation)
+                    if not backend.uses_registered_buffers:
+                        _copy_observation(result.observation, observation)
                     connection.send(("step", result.reward, result.terminated, result.info))
                     continue
                 msg = f"unknown worker command: {operation!r}"

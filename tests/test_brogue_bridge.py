@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from broguegym.actions import Action, ActionKind, Direction
@@ -12,7 +13,9 @@ from broguegym.brogue import (
     BackendErrorCode,
     BackendInfoKey,
     _InProcessBrogue,
+    _BRIDGE_OBSERVATION_MASK_SCREEN,
     _CObservation,
+    _allocate_observation_buffers,
     _default_library_path,
     _observation_from_c,
 )
@@ -103,6 +106,56 @@ def test_brogue_bridge_drives_one_bridge_session_if_built() -> None:
         env.close()
 
 
+def test_brogue_bridge_registered_buffers_match_legacy_reset_if_built() -> None:
+    library_path = _default_library_path()
+    if not library_path.exists():
+        pytest.skip("run through uv so package sync builds the bridge")
+
+    legacy = _InProcessBrogue()
+    try:
+        legacy_reset = legacy.reset(seed=1)
+    finally:
+        legacy.close()
+
+    buffers = _allocate_observation_buffers()
+    registered = _InProcessBrogue(output_buffers=buffers)
+    try:
+        registered_reset = registered.reset(seed=1)
+
+        assert registered.uses_registered_buffers is True
+        for key in ("glyphs", "chars", "colors_fg", "colors_bg", "message", "program_state"):
+            np.testing.assert_array_equal(registered_reset.observation[key], legacy_reset.observation[key])
+    finally:
+        registered.close()
+
+
+def test_brogue_bridge_registered_screen_profile_leaves_semantics_untouched_if_built() -> None:
+    library_path = _default_library_path()
+    if not library_path.exists():
+        pytest.skip("run through uv so package sync builds the bridge")
+
+    buffers = _allocate_observation_buffers()
+    buffers["map_has_item"].fill(123)
+    buffers["map_monster_kind"].fill(456)
+    buffers["inventory_present"].fill(77)
+    backend = _InProcessBrogue(
+        output_buffers=buffers,
+        observation_mask=_BRIDGE_OBSERVATION_MASK_SCREEN,
+    )
+
+    try:
+        reset = backend.reset(seed=1)
+
+        assert backend.uses_registered_buffers is True
+        assert int(reset.observation["program_state"][4]) == 1
+        assert np.any(reset.observation["glyphs"] != 0)
+        assert np.all(buffers["map_has_item"] == 123)
+        assert np.all(buffers["map_monster_kind"] == 456)
+        assert np.all(buffers["inventory_present"] == 77)
+    finally:
+        backend.close()
+
+
 def test_brogue_bridge_reports_invalid_noop_key_without_closing_if_built() -> None:
     library_path = _default_library_path()
     if not library_path.exists():
@@ -115,6 +168,28 @@ def test_brogue_bridge_reports_invalid_noop_key_without_closing_if_built() -> No
         rejected = backend.step(Action.keypress("!"))
         assert rejected.info[BackendInfoKey.ERROR_CODE] is BackendErrorCode.KEY_INVALID
         assert rejected.info[BackendInfoKey.ERROR] == "Brogue rejected key '!' in the current state"
+        assert rejected.terminated is False
+
+        result = backend.step(Action(kind=ActionKind.REST))
+        assert result.info[BackendInfoKey.KEY] == "z"
+        assert result.terminated is False
+    finally:
+        backend.close()
+
+
+def test_brogue_bridge_registered_path_reports_invalid_key_if_built() -> None:
+    library_path = _default_library_path()
+    if not library_path.exists():
+        pytest.skip("run through uv so package sync builds the bridge")
+
+    buffers = _allocate_observation_buffers()
+    backend = _InProcessBrogue(output_buffers=buffers)
+
+    try:
+        backend.reset(seed=1)
+        rejected = backend.step(Action.keypress("!"))
+        assert backend.uses_registered_buffers is True
+        assert rejected.info[BackendInfoKey.ERROR_CODE] is BackendErrorCode.KEY_INVALID
         assert rejected.terminated is False
 
         result = backend.step(Action(kind=ActionKind.REST))
