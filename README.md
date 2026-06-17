@@ -25,7 +25,8 @@ import broguegym
 import gymnasium as gym
 
 env = gym.make(broguegym.BROGUE_ENV_ID)
-obs, info = env.reset(seed=42)
+obs, info = env.reset(seed=42)  # samples a Brogue game seed from sampler seed 42
+obs, info = env.reset(seed=42, options={"game_seed": 123})
 obs, reward, term, trunc, info = env.step(env.action_space.sample())
 env.close()
 ```
@@ -33,12 +34,13 @@ env.close()
 Batched (for training):
 
 ```python
-from broguegym import BrogueBackend
+from broguegym import BrogueVectorEnv
 
-backend = BrogueBackend(num_envs=64)
-resets = backend.reset_many(seed=42)
-steps = backend.step_many(actions)
-backend.close()
+envs = BrogueVectorEnv(num_envs=64)
+resets = envs.reset(seed=42)  # samples 64 Brogue seeds from sampler seed 42
+resets = envs.reset(seed=42, game_seed=list(range(1, 65)))
+steps = envs.step(actions)
+envs.close()
 ```
 
 ## Development

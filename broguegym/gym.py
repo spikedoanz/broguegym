@@ -11,7 +11,14 @@ from gymnasium.envs.registration import register, registry  # pyright: ignore[re
 
 from broguegym._render import TerminalCharset, observation_to_ansi
 from broguegym.actions import Action
-from broguegym.brogue import BackendInfoKey, BackendReset, BackendStep, BrogueBackend, ObservationDict
+from broguegym.brogue import (
+    BackendInfoKey,
+    BackendReset,
+    BackendStep,
+    BrogueGameSeedSpec,
+    BrogueVectorEnv,
+    ObservationDict,
+)
 from broguegym.snapshot import BrogueSnapshot
 from broguegym.spaces import (
     ActionSet,
@@ -26,14 +33,17 @@ from broguegym.spaces import (
 BROGUE_ENV_ID: Final = "Bruhogue-v0"
 
 
-class _BrogueGame(Protocol):
+class _BrogueVectorGame(Protocol):
+    num_envs: int
+
     def reset(
         self,
         *,
         seed: int | None = None,
-    ) -> BackendReset: ...
+        game_seed: BrogueGameSeedSpec | None = None,
+    ) -> list[BackendReset]: ...
 
-    def step(self, action: Action) -> BackendStep: ...
+    def step(self, actions: Sequence[Action]) -> list[BackendStep]: ...
 
     def snapshot(self) -> BrogueSnapshot: ...
 
@@ -53,14 +63,27 @@ def register_envs() -> None:
     )
 
 
+def _reset_game_seed(options: dict[str, object] | None) -> BrogueGameSeedSpec | None:
+    if not options:
+        return None
+    if set(options) != {"game_seed"}:
+        msg = "BrogueEnv reset options support only 'game_seed'"
+        raise ValueError(msg)
+    return cast(BrogueGameSeedSpec, options["game_seed"])
+
+
 class BrogueEnv(gym.Env[ObservationDict, int]):
-    """Gymnasium environment backed by a low-level Brogue game object."""
+    """Scalar Gymnasium wrapper around a one-environment BrogueVectorEnv.
+
+    The reset ``seed`` is a sampler seed. Reset option ``{"game_seed": ...}``
+    overrides the concrete Brogue seed sampled from it.
+    """
 
     metadata = {"render_modes": ["ansi"]}
 
     def __init__(
         self,
-        backend: _BrogueGame | None = None,
+        vector_env: _BrogueVectorGame | None = None,
         *,
         render_mode: str | None = None,
         render_charset: TerminalCharset = "ascii",
@@ -80,7 +103,10 @@ class BrogueEnv(gym.Env[ObservationDict, int]):
             msg = "max_episode_steps must be positive"
             raise ValueError(msg)
 
-        self.backend = backend if backend is not None else BrogueBackend(1)
+        self.vector_env = vector_env if vector_env is not None else BrogueVectorEnv(1)
+        if self.vector_env.num_envs != 1:
+            msg = "BrogueEnv requires a vector_env with num_envs == 1"
+            raise ValueError(msg)
         self.render_mode = render_mode
         self.render_charset: TerminalCharset = render_charset
         self.max_episode_steps = max_episode_steps
@@ -105,13 +131,11 @@ class BrogueEnv(gym.Env[ObservationDict, int]):
         seed: int | None = None,
         options: dict[str, object] | None = None,
     ) -> tuple[ObservationDict, dict[str, object]]:
-        """Reset the Brogue game and return Gymnasium's `(observation, info)` pair."""
+        """Reset the wrapped Brogue game and return Gymnasium's `(observation, info)` pair."""
 
-        if options:
-            msg = "BrogueEnv does not support reset options"
-            raise ValueError(msg)
+        game_seed = _reset_game_seed(options)
         super().reset(seed=seed)
-        result = self.backend.reset(seed=seed)
+        result = self.vector_env.reset(seed=seed, game_seed=game_seed)[0]
         observation = self._gym_observation(result.observation)
         self._elapsed_steps = 0
         self._last_observation = observation
@@ -124,7 +148,7 @@ class BrogueEnv(gym.Env[ObservationDict, int]):
             msg = f"invalid Brogue action index: {action}"
             raise ValueError(msg)
 
-        result = self.backend.step(self.actions[int(action)])
+        result = self.vector_env.step([self.actions[int(action)]])[0]
         observation = self._gym_observation(result.observation)
         self._elapsed_steps += 1
         truncated = (
@@ -152,12 +176,12 @@ class BrogueEnv(gym.Env[ObservationDict, int]):
     def snapshot(self) -> BrogueSnapshot:
         """Return an in-memory full-state snapshot from the backend."""
 
-        return self.backend.snapshot()
+        return self.vector_env.snapshot()
 
     def restore(self, snapshot: BrogueSnapshot) -> tuple[ObservationDict, dict[str, object]]:
         """Restore an in-memory snapshot and return the restored observation."""
 
-        result = self.backend.restore(snapshot)
+        result = self.vector_env.restore(snapshot)
         observation = self._gym_observation(result.observation)
         self._elapsed_steps = 0
         self._last_observation = observation
@@ -178,7 +202,7 @@ class BrogueEnv(gym.Env[ObservationDict, int]):
     def close(self) -> None:
         """Release backend resources."""
 
-        self.backend.close()
+        self.vector_env.close()
 
     def __enter__(self) -> Self:
         """Allow `with BrogueEnv(...) as env:` usage in training scripts."""

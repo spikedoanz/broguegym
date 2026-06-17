@@ -78,11 +78,10 @@ def test_brogue_bridge_drives_one_bridge_session_if_built() -> None:
     if not library_path.exists():
         pytest.skip("run through uv so package sync builds the bridge")
 
-    backend = _InProcessBrogue()
-    env = BrogueEnv(backend=backend, render_mode="ansi")
+    env = BrogueEnv(render_mode="ansi")
 
     try:
-        observation, info = env.reset(seed=1)
+        observation, info = env.reset(options={"game_seed": 1})
         assert env.observation_space.contains(observation)
         assert "inventory_strs" in observation
         assert info == {BackendInfoKey.SEED: int(observation["program_state"][4])}
@@ -111,7 +110,7 @@ def test_brogue_bridge_reports_invalid_noop_key_without_closing_if_built() -> No
     backend = _InProcessBrogue()
 
     try:
-        backend.reset(seed=1)
+        backend.reset(game_seed=1)
         rejected = backend.step(Action.keypress("!"))
         assert rejected.info[BackendInfoKey.ERROR_CODE] is BackendErrorCode.KEY_INVALID
         assert rejected.info[BackendInfoKey.ERROR] == "Brogue rejected key '!' in the current state"
@@ -132,7 +131,7 @@ def test_brogue_bridge_can_close_inventory_if_built() -> None:
     backend = _InProcessBrogue()
 
     try:
-        backend.reset(seed=1)
+        backend.reset(game_seed=1)
         opened = backend.step(Action(kind=ActionKind.INVENTORY))
         assert opened.terminated is False
 
@@ -156,7 +155,7 @@ def test_brogue_bridge_accepts_cursor_keys_with_button_overlay_if_built() -> Non
     backend = _InProcessBrogue()
 
     try:
-        backend.reset(seed=1)
+        backend.reset(game_seed=1)
         cursor = backend.step(Action(kind=ActionKind.CURSOR))
         assert BackendInfoKey.ERROR_CODE not in cursor.info
 
@@ -178,10 +177,9 @@ def test_brogue_bridge_close_does_not_write_last_game_if_built(
         pytest.skip("run through uv so package sync builds the bridge")
 
     monkeypatch.chdir(tmp_path)
-    backend = _InProcessBrogue()
-    env = BrogueEnv(backend=backend)
+    env = BrogueEnv()
 
-    env.reset(seed=1)
+    env.reset(options={"game_seed": 1})
     env.close()
 
     assert list(tmp_path.glob("LastGame*.broguesave")) == []
@@ -195,7 +193,7 @@ def test_brogue_bridge_passes_modifier_actions_if_built() -> None:
     backend = _InProcessBrogue()
 
     try:
-        backend.reset(seed=1)
+        backend.reset(game_seed=1)
         result = backend.step(Action(kind=ActionKind.LONG_SEARCH))
         assert result.info[BackendInfoKey.KEY] == "s"
         assert result.info[BackendInfoKey.CONTROL] is True
