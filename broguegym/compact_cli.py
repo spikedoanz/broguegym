@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import curses
+import select
 import secrets
 import sys
-from collections.abc import Sequence
+import termios
+import tty
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import msgspec
 
 _BRIDGE_ABI_VERSION = 11
 _COMPACT_COLS = 79
@@ -46,8 +51,19 @@ _PROGRAM_STATE_NAMES = (
     "seed",
     "gold",
     "score",
-    "in_progress",
+    "flags",
 )
+_MISSING_COMPACT_FIELDS = (
+    "inventory",
+    "message_log",
+    "colors",
+    "item_ids",
+    "monster_ids",
+    "map_flags",
+    "terrain_layers",
+)
+
+type KeyEvent = tuple[str, bool, bool]
 
 
 class _CCompactObservation(ctypes.Structure):
@@ -229,134 +245,179 @@ def _named_values(names: Sequence[str], values: Sequence[int]) -> list[str]:
     return rows
 
 
-def _compact_text(observation: _CCompactObservation, status: str = "") -> str:
+def _state_dict(observation: _CCompactObservation) -> dict[str, object]:
+    blstats = [int(value) for value in observation.blstats]
+    program = [int(value) for value in observation.program_state]
+    flags = program[7]
+    return {
+        "x": blstats[0],
+        "y": blstats[1],
+        "strength": blstats[2],
+        "hp": blstats[3],
+        "max_hp": blstats[4],
+        "depth": blstats[5],
+        "gold": blstats[6],
+        "turn": program[0],
+        "absolute_turn": blstats[8],
+        "stealth": blstats[9],
+        "nutrition": blstats[10],
+        "seed": program[4],
+        "score": program[6],
+        "terminated": bool(program[1]),
+        "won": bool(program[2]),
+        "in_progress": bool(flags & 1),
+        "quit": bool(flags & 2),
+        "disturbed": bool(flags & 4),
+        "flags": flags,
+    }
+
+
+def _state_line(observation: _CCompactObservation) -> str:
+    state = _state_dict(observation)
+    return (
+        f"state: depth={state['depth']} turn={state['turn']} "
+        f"pos=({state['x']},{state['y']}) hp={state['hp']}/{state['max_hp']} "
+        f"str={state['strength']} gold={state['gold']} score={state['score']} "
+        f"nutrition={state['nutrition']} stealth={state['stealth']} "
+        f"seed={state['seed']} in_progress={state['in_progress']} "
+        f"disturbed={state['disturbed']} terminated={state['terminated']} won={state['won']}"
+    )
+
+
+def _compact_text(observation: _CCompactObservation) -> str:
     lines = _compact_map_lines(observation)
     blstats = list(observation.blstats)
     program_state = list(observation.program_state)
     lines.append("")
+    lines.append(_state_line(observation))
     lines.append("blstats: " + " ".join(_named_values(_BLSTAT_NAMES, blstats)))
     lines.append("program_state: " + " ".join(_named_values(_PROGRAM_STATE_NAMES, program_state)))
-    if status:
-        lines.append(status)
+    lines.append("inventory: not_observed")
+    lines.append("message_log: not_observed")
+    lines.append(f"compact_agent_bytes={_COMPACT_AGENT_BYTES} bridge_struct_bytes={ctypes.sizeof(_CCompactObservation)} colors=none")
+    lines.append("not_observed: " + ", ".join(_MISSING_COMPACT_FIELDS))
     return "\n".join(lines)
 
 
-def _curses_key_to_brogue(key: int) -> str | None:
-    match key:
-        case curses.KEY_UP:
-            return "k"
-        case curses.KEY_DOWN:
-            return "j"
-        case curses.KEY_LEFT:
-            return "h"
-        case curses.KEY_RIGHT:
-            return "l"
-        case curses.KEY_HOME:
-            return "y"
-        case curses.KEY_PPAGE:
-            return "u"
-        case curses.KEY_END:
-            return "b"
-        case curses.KEY_NPAGE:
-            return "n"
-        case curses.KEY_ENTER:
-            return "\n"
-        case 10 | 13:
-            return "\n"
-        case _:
-            if 0 <= key <= 255:
-                return chr(key)
-            return None
+def _step(game: _CompactBrogue, step_count: int, event: KeyEvent) -> int:
+    key, control, shift = event
+    try:
+        result = game.step(key, control=control, shift=shift and not key.isupper())
+    except (RuntimeError, ValueError) as exc:
+        _emit("error", step_count + 1, game.observation, event, {"error": str(exc)})
+        return step_count + 1
+
+    info: dict[str, object] = {}
+    if result.invalid:
+        info["error_code"] = "key_invalid"
+        info["error"] = f"Brogue rejected key {key!r} in the current state"
+    _emit("error" if result.invalid else "step", step_count + 1, game.observation, event, info)
+    if game.observation.program_state[1]:
+        raise SystemExit(0)
+    return step_count + 1
 
 
-def _draw(stdscr: Any, observation: _CCompactObservation, status: str) -> None:
-    stdscr.erase()
-    height, width = stdscr.getmaxyx()
-    map_lines = _compact_map_lines(observation)
-    for row, line in enumerate(map_lines[:height]):
-        stdscr.addnstr(row, 0, line, max(0, width - 1))
-
-    side_x = _COMPACT_COLS + 2
-    info_rows = [
-        "compact observation",
-        "chars: 79x29 uint8",
-        f"agent bytes: {_COMPACT_AGENT_BYTES}",
-        f"bridge struct: {ctypes.sizeof(_CCompactObservation)}",
-        "colors: not included",
-        "Ctrl-C exits",
-        "",
-        "blstats",
-        *_named_values(_BLSTAT_NAMES, list(observation.blstats)),
-        "",
-        "program_state",
-        *_named_values(_PROGRAM_STATE_NAMES, list(observation.program_state)),
-    ]
-    if width > side_x + 8:
-        for row, line in enumerate(info_rows[:height]):
-            stdscr.addnstr(row, side_x, line, max(0, width - side_x - 1))
-    else:
-        start = min(_COMPACT_ROWS + 1, max(0, height - 5))
-        for offset, line in enumerate(info_rows[: max(0, height - start - 1)]):
-            stdscr.addnstr(start + offset, 0, line, max(0, width - 1))
-
-    if status and height > 0:
-        stdscr.addnstr(height - 1, 0, status, max(0, width - 1))
-    stdscr.refresh()
-
-
-def _play_curses(stdscr: Any, game: _CompactBrogue) -> None:
-    curses.curs_set(0)
-    curses.noecho()
-    curses.cbreak()
-    stdscr.keypad(True)
-    status = ""
-    while True:
-        _draw(stdscr, game.observation, status)
-        key = stdscr.getch()
-        brogue_key = _curses_key_to_brogue(key)
-        if brogue_key is None:
-            status = f"unhandled terminal key: {key}"
-            continue
-        result = game.step(brogue_key)
-        status = f"sent {brogue_key!r}"
-        if result.invalid:
-            status += " (invalid in current Brogue state)"
-        if game.observation.program_state[1]:
-            status += " terminated"
+def _emit(
+    event_name: str,
+    step_count: int,
+    observation: _CCompactObservation,
+    event: KeyEvent | None = None,
+    info: dict[str, object] | None = None,
+) -> None:
+    program = [int(value) for value in observation.program_state]
+    state = _state_dict(observation)
+    key, control, shift = (None, False, False) if event is None else event
+    payload = {
+        "event": event_name,
+        "step": step_count,
+        "key": key,
+        "control": control,
+        "shift": shift,
+        "turn": program[0],
+        "terminated": bool(program[1]),
+        "won": bool(program[2]),
+        "depth": program[3],
+        "seed": program[4],
+        "gold": program[5],
+        "score": program[6],
+        "state": state,
+        "compact_agent_bytes": _COMPACT_AGENT_BYTES,
+        "bridge_struct_bytes": ctypes.sizeof(_CCompactObservation),
+        "colors": None,
+        "inventory": None,
+        "message_log": None,
+        "not_observed": list(_MISSING_COMPACT_FIELDS),
+        "blstats": [int(value) for value in observation.blstats],
+        "program_state": program,
+        "info": {} if info is None else info,
+    }
+    sys.stdout.write(msgspec.json.encode(payload).decode() + "\n")
+    sys.stdout.write(_compact_text(observation) + "\n")
+    sys.stdout.flush()
 
 
-def _run_script(game: _CompactBrogue, script: str, *, print_each: bool) -> None:
-    status = "reset"
-    if print_each:
-        print(_compact_text(game.observation, status))
-    for key in script:
-        result = game.step(key)
-        status = f"sent {key!r}"
-        if result.invalid:
-            status += " (invalid in current Brogue state)"
-        if print_each:
-            print("\n" + "=" * _COMPACT_COLS)
-            print(_compact_text(game.observation, status))
-    if not print_each:
-        print(_compact_text(game.observation, status))
+def _scripted(actions: str | None) -> Iterator[KeyEvent] | None:
+    return None if actions is None else (_event(bytes((ord(char),))) for char in actions)
+
+
+def _read_event() -> KeyEvent | None:
+    data = sys.stdin.buffer.read(1)
+    if data in (b"", b"\x04"):
+        return None
+    if data == b"\x1b":
+        return _arrow_event() or ("\x1b", False, False)
+    return _event(data)
+
+
+def _arrow_event() -> KeyEvent | None:
+    if not select.select([sys.stdin], [], [], 0.01)[0]:
+        return None
+    arrows: dict[bytes, KeyEvent] = {
+        b"[A": ("k", False, False),
+        b"[B": ("j", False, False),
+        b"[C": ("l", False, False),
+        b"[D": ("h", False, False),
+    }
+    return arrows.get(sys.stdin.buffer.read(2))
+
+
+def _event(data: bytes) -> KeyEvent:
+    if data == b"\r":
+        return ("\n", False, False)
+    if 1 <= data[0] <= 26 and data not in (b"\t", b"\n"):
+        return (chr(ord("a") + data[0] - 1), True, False)
+    key = data.decode("latin-1")
+    return (key, False, key.isalpha() and key.isupper())
+
+
+@contextmanager
+def _stdin_mode() -> Generator[None, None, None]:
+    if not sys.stdin.isatty():
+        yield
+        return
+    fd, previous = sys.stdin.fileno(), termios.tcgetattr(sys.stdin.fileno())
+    try:
+        tty.setcbreak(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = int(attrs[0]) & ~termios.IXON
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Play Brogue through the compact char-only observation used by Puffer agents.",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Brogue seed; 0 uses the Gym fixed seed")
+    parser.add_argument("--seed", type=int, default=None, help="Optional Brogue seed; 0 uses the Gym fixed seed.")
+    parser.add_argument("--actions", default=None, help="Replay raw keys instead of reading stdin.")
     parser.add_argument("--library", type=Path, default=_default_library_path())
     parser.add_argument("--data-dir", type=Path, default=_default_data_dir())
     parser.add_argument(
         "--script",
         default=None,
-        help="Run these literal Brogue keys non-interactively and print the compact observation.",
-    )
-    parser.add_argument(
-        "--print-each",
-        action="store_true",
-        help="With --script, print the compact observation after reset and after every key.",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args(argv)
 
@@ -365,13 +426,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     with _CompactBrogue(library_path=args.library, data_dir=args.data_dir) as game:
         game.reset(args.seed)
-        if args.script is not None:
-            _run_script(game, args.script, print_each=bool(args.print_each))
-            return 0
-        try:
-            curses.wrapper(_play_curses, game)
-        except KeyboardInterrupt:
-            return 0
+        step_count = 0
+        _emit("reset", step_count, game.observation)
+        actions = args.actions if args.actions is not None else args.script
+        events = _scripted(actions)
+        if events is not None:
+            for event in events:
+                step_count = _step(game, step_count, event)
+        else:
+            with _stdin_mode():
+                while event := _read_event():
+                    step_count = _step(game, step_count, event)
     return 0
 
 
