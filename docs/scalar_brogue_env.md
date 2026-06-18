@@ -17,6 +17,7 @@ to an acceptable level.
 - `brh_env_create(const brh_env_buffers *buffers)`
 - `brh_env_reset(brh_env *env, uint64_t seed)`
 - `brh_env_step(brh_env *env, long key, int control, int shift)`
+- `brh_env_step_no_observation(brh_env *env, long key, int control, int shift)`
 - `brh_env_step_from_buffers(brh_env *env)`
 - `brh_env_num_agents(const brh_env *env)`
 - `brh_env_close(brh_env *env)`
@@ -81,6 +82,49 @@ The immediate blocker is scalar step cost:
 Until `N=1` is acceptable, a C vector manager or Puffer Ocean binding would only
 batch a slow scalar kernel.
 
+## Current N=1 Throughput
+
+Last measured: 2026-06-17 22:40 EDT.
+
+Command:
+
+```sh
+uv run python scripts/bench_bridge_c.py --profile standard --trace-repeats 3 --seed-count 1
+```
+
+Commit flags:
+
+```text
+broguegym=feature/scalar-brogue-env@7e10b2e[dirty:1T/1U] BrogueCE=feature/scalar-brogue-env@2c294f1[dirty:0T/1U] broguegym-dev=4.0@e90b58ed[clean]
+```
+
+Dirty state at measurement time was expected: the parent saw the BrogueCE
+submodule's untracked generated dylib plus the local `NOTES` file; BrogueCE saw
+only `bin/libbruhogue_brogue.dylib`.
+
+Observation size: 155,032 bytes. Direct C scalar ABI, no Python step loop.
+
+| Case | Median us/step | Median steps/s | Note |
+| --- | ---: | ---: | --- |
+| copy-only | 2.35 | 426,158 | memcpy floor for the full observation size |
+| invalid-key | 89.76 | 11,140 | invalid input loop with full observation export |
+| invalid-no-obs | 60.43 | 16,548 | invalid input loop without full observation export |
+| rest | 510.86 | 1,957 | valid Brogue step with full observation export |
+| rest-no-obs | 494.07 | 2,024 | valid Brogue step without full observation export |
+| search | 515.17 | 1,941 | valid Brogue step with full observation export |
+| search-no-obs | 488.34 | 2,048 | valid Brogue step without full observation export |
+| explore | 514.62 | 1,943 | valid Brogue step with full observation export |
+| explore-no-obs | 451.23 | 2,216 | valid Brogue step without full observation export |
+| fast-explore | 422.56 | 2,367 | valid Brogue step with full observation export |
+| fastx-no-obs | 422.74 | 2,366 | valid Brogue step without full observation export |
+| reset | 19,459.18 | 51 | reset cost |
+
+The no-observation ABI is useful, but it did not reveal a huge hidden memcpy or
+semantic-fill tax on ordinary valid actions. `rest` improved from 1,957 to 2,024
+steps/s, `search` from 1,941 to 2,048 steps/s, and `explore` from 1,943 to 2,216
+steps/s. Most of the `N=1` cost is still in Brogue's step/event/render path and
+the pthread handoff, not in Python or the final 155 KiB observation copy.
+
 ## Next Milestone: N=1 Scalar Throughput
 
 The concrete target is to make this path fast before changing batching:
@@ -114,17 +158,17 @@ support measuring smaller observation profiles than the current full
    does not tell us which part of the valid-action path is responsible for the
    ~500 us step time.
 
-2. **Add a no-observation step mode**
+2. **Use the no-observation step mode as a guardrail**
 
-   Add an ABI-visible mode or debug function that advances Brogue without filling
+   ABI 9 adds a debug/performance function that advances Brogue without filling
    a full observation. This gives a lower bound for game/input overhead:
 
    ```c
    int brh_env_step_no_observation(brh_env *env, long key, int control, int shift);
    ```
 
-   If this is still slow, the problem is the pthread bridge/game loop. If this is
-   fast, the problem is observation export.
+   Current measurements show this is still slow for valid actions, so the next
+   target is the pthread bridge/game/render loop rather than Python interop.
 
 3. **Add compact observation profiles**
 
