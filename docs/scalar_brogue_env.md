@@ -125,6 +125,44 @@ steps/s, `search` from 1,941 to 2,048 steps/s, and `explore` from 1,943 to 2,216
 steps/s. Most of the `N=1` cost is still in Brogue's step/event/render path and
 the pthread handoff, not in Python or the final 155 KiB observation copy.
 
+## Puffer NetHack Scalar Reference
+
+Last measured: 2026-06-17 EDT.
+
+This is a reference point for the question "what does a fast scalar roguelike C
+env look like?" It is not a vectorized `StaticVec` measurement. The binary is
+Puffer's standalone `ocean/nethack/nethack.c` harness with one `Nethack env` in
+one process and thread-count environment variables pinned to one.
+
+The local macOS run required a throwaway modified-NLE checkout at commit
+`188b523` plus local build-system workarounds for Linux linker flags and
+Darwin/glibc allocator differences. Those source compatibility changes were not
+saved to this branch; use Linux for authoritative Puffer/NLE comparisons.
+
+Command shape:
+
+```sh
+/usr/bin/time -l env \
+  OMP_NUM_THREADS=1 \
+  OPENBLAS_NUM_THREADS=1 \
+  VECLIB_MAXIMUM_THREADS=1 \
+  MKL_NUM_THREADS=1 \
+  NUMEXPR_NUM_THREADS=1 \
+  NETHACKDIR=$PWD/vendor/nle/src/build/dat \
+  ./nethack bench 1000000 random
+```
+
+| Env | Policy | Steps | Steps/s | Max RSS | Peak memory footprint |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Puffer NetHack scalar | wait | 10,000 | 82,921 | not measured | not measured |
+| Puffer NetHack scalar | wait | 1,000,000 | 81,301 | 16,285,696 bytes | 9,013,120 bytes |
+| Puffer NetHack scalar | random | 1,000,000 | 113,459 | 19,152,896 bytes | 11,683,776 bytes |
+
+Against the current Brogue direct C valid-step lane, this scalar NetHack path is
+roughly 34x to 58x faster depending on which Brogue action profile is used for
+the denominator. That comparison should be rerun on Linux before treating the
+ratio as a stable target.
+
 ## Next Milestone: N=1 Scalar Throughput
 
 The concrete target is to make this path fast before changing batching:
