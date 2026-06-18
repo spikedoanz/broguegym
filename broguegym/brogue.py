@@ -289,7 +289,7 @@ class _InProcessBrogue:
         raise BackendUnavailableError(BackendErrorCode.BRIDGE_OPERATION_FAILED, msg)
 
 
-_BRIDGE_ABI_VERSION = 9
+_BRIDGE_ABI_VERSION = 11
 _SCREEN_COLS = 100
 _SCREEN_ROWS = 34
 _MAP_COLS = 79
