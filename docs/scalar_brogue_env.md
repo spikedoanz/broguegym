@@ -4,10 +4,11 @@ This branch introduces a scalar C environment contract as the bridge target for
 Python and for a future Puffer Ocean binding. It is deliberately not a vector
 manager.
 
-The first real performance step is not the Puffer binding. A thin Puffer Ocean
-binding is mostly plumbing, but it will only be useful at `total_agents = 1`
-while Brogue has process-global mutable game state. The next implementation
-milestone is making multiple Brogue environments correct in one process.
+The first real performance step is not the Puffer binding, and it is not
+multi-env correctness yet. A thin Puffer Ocean binding is mostly plumbing, and
+multi-env correctness only matters once the scalar env is fast enough to be worth
+batching. The next implementation milestone is getting `N=1` scalar throughput
+to an acceptable level.
 
 ## C Surface
 
@@ -58,17 +59,131 @@ Puffer's action into key/control/shift and call `brh_env_step`. Puffer should ow
 batching, OpenMP scheduling, and contiguous rollout buffers.
 
 This binding should not be treated as the source of truth for batching. It should
-be a thin adapter over a scalar `brh_env` once `brh_env` can safely coexist with
-other `brh_env` instances in the same process.
+be a thin adapter over a scalar `brh_env` after scalar throughput is acceptable
+and `brh_env` can safely coexist with other `brh_env` instances in the same
+process.
 
 ## Remaining Blocker
 
-This is still single-instance-safe only. The next performance milestone is a
-state-isolation audit of reset, step, and observation fill paths. Until that is
-done, a C vector manager or Puffer Ocean binding must not instantiate multiple
-Brogue envs in one process.
+The current scalar C path is only around 2k valid gameplay steps/sec for one
+instance. That is not good enough to justify spending the next work block on
+Puffer or `N > 1` scheduling.
 
-## Next Milestone: Multiple Envs Per Process
+The immediate blocker is scalar step cost:
+
+- Brogue game work
+- pthread/condition-variable bridge handoff
+- full `brh_observation` fill
+- semantic map/item/monster/inventory observation fill
+- full observation export/copy
+- Python-side conversion for the ctypes backend
+
+Until `N=1` is acceptable, a C vector manager or Puffer Ocean binding would only
+batch a slow scalar kernel.
+
+## Next Milestone: N=1 Scalar Throughput
+
+The concrete target is to make this path fast before changing batching:
+
+```c
+brh_env *env = brh_env_create(&buffers);
+brh_env_reset(env, 1);
+for (int i = 0; i < steps; i++) {
+    brh_env_step(env, 'z', 0, 0);
+}
+brh_env_close(env);
+```
+
+This should have stable, reproducible timing for fixed action traces and should
+support measuring smaller observation profiles than the current full
+`brh_observation`.
+
+## Concrete N=1 Next Steps
+
+1. **Make the benchmark phase-aware**
+
+   Extend the direct C benchmark so a scalar step can be broken into:
+
+   - action handoff / wakeup
+   - Brogue turn processing
+   - screen observation fill
+   - semantic map/item/monster/inventory fill
+   - final observation copy or pack
+
+   The current benchmark reports only end-to-end step cases plus copy-only. It
+   does not tell us which part of the valid-action path is responsible for the
+   ~500 us step time.
+
+2. **Add a no-observation step mode**
+
+   Add an ABI-visible mode or debug function that advances Brogue without filling
+   a full observation. This gives a lower bound for game/input overhead:
+
+   ```c
+   int brh_env_step_no_observation(brh_env *env, long key, int control, int shift);
+   ```
+
+   If this is still slow, the problem is the pthread bridge/game loop. If this is
+   fast, the problem is observation export.
+
+3. **Add compact observation profiles**
+
+   Do not make the default policy path fill the 155 KiB full observation. Add
+   explicit profiles, for example:
+
+   - `none`: step only
+   - `screen`: screen chars/glyph ids only
+   - `core`: screen + `blstats` + message + program state
+   - `full`: current raw `brh_observation`
+
+   The C API should make the selected profile explicit at env creation or step
+   time. Puffer should start on `screen` or `core`, not `full`.
+
+4. **Port registered/caller-owned buffer filling onto the scalar ABI**
+
+   The scalar ABI already has caller-owned buffers, but the Python path still
+   materializes a full `_CObservation` and then converts it into owned NumPy
+   arrays. Reintroduce direct writes into registered field buffers or packed
+   policy buffers on top of `brh_env`, so Python does not allocate/copy the full
+   dict on every step when it is not needed.
+
+5. **Skip expensive semantic fills unless requested**
+
+   Split `bridge_fill_observation` so map semantics, inventory strings, item
+   metadata, monster metadata, and color tensors are not filled for compact
+   policy observations. These fields are useful for debugging and privileged
+   training, but they should not be on the hot path by default.
+
+6. **Measure Python separately from C**
+
+   Keep three benchmark lanes:
+
+   - direct C scalar ABI
+   - Python `_InProcessBrogue` scalar backend
+   - process-backed `BrogueBackend`
+
+   Only the first lane answers whether the C bridge is fast enough. The process
+   backend numbers should not be used to judge the scalar C kernel.
+
+7. **Only then consider replacing pthread handoff**
+
+   If compact/no-observation stepping is still too slow, the pthread bridge
+   architecture is likely the bottleneck. At that point evaluate a same-thread
+   coroutine/fcontext-style bridge, NLE-style, so each input wait yields directly
+   to the caller instead of using a background pthread and condition variables.
+
+## N=1 Acceptance Criteria
+
+- Direct C benchmark reports separate timings for no-observation, screen/core,
+  and full observation profiles.
+- Compact policy observation is materially faster than full observation.
+- Python scalar backend can use the compact/direct-buffer path without per-step
+  full-dict allocation.
+- We have a defensible scalar throughput number before starting `N > 1`.
+- If the compact path still cannot meet the target, the benchmark identifies
+  whether the remaining cost is game simulation or bridge scheduling.
+
+## Following Milestone: Multiple Envs Per Process
 
 Puffer's `vecenv.h` allocates an array of `Env` structs and calls `c_reset` and
 `c_step` on each one, including through OpenMP. For Brogue, that requires two
@@ -94,6 +209,8 @@ Threaded stepping can come after that; first prove sequential multi-instance
 correctness.
 
 ## Concrete Next Steps
+
+These steps should wait until the `N=1` scalar path is acceptable.
 
 1. **Add a failing multi-env C test**
 
@@ -197,7 +314,7 @@ correctness.
    reward fields or Puffer-side reward shaping from `program_state`, depth, gold,
    exploration, invalid key status, and terminal outcome.
 
-## Acceptance Criteria
+## Multi-Env Acceptance Criteria
 
 - `brh_env_create` can create at least two live envs in one process.
 - Sequential `N=2` reset/step/close passes repeatedly under sanitizers.
