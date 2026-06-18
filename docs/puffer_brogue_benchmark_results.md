@@ -19,23 +19,21 @@ current NLE chars-only observation (`1659` bytes), which is the source of the
 "100x bigger" number. The Puffer policy observation is not using that full
 payload by default; its Brogue observation is now only `1.45x` NLE.
 
+Fidelity correction: compact observation no longer implies compact simulation
+shortcuts. The default `brh_step_compact` path now keeps full Brogue turn,
+monster, lighting, and environment simulation. The earlier compact fast-turn
+path is available only as an explicit lossy benchmark mode by setting
+`BROGUE_COMPACT_SIMULATION_SHORTCUTS=1`; it should not be treated as the
+playable agent environment.
+
 ## Latest Same-Harness Results
 
-These rows were run after adding `profile envspeed` phase timing, explicit
-benchmark action modes, optional `BROGUE_PROFILE=1` Brogue counters, the
-compact bridge observation path, map-only compact observations, compact mode
-sidebar elision, the bridge/server fast-input path, the dirty-cell compact map
-cache, compact miner-light/FOV reuse, compact display short-circuits, compact
-waypoint refresh skipping, compact terrain-glow skipping, compact environment
-gas/promotion/fire skipping, compact visibility transition lists, terrain/gas
-caches, active gas-cell diffusion, and light-distance caching. The most relevant column for
-simulation speed is `Env-step SPS/core`: it is computed from Puffer's
-`EVAL_ENV_STEP` timer, so GPU/copy time is excluded.
-
-The latest Brogue movement row uses the compact training fast-turn path. That
-path keeps compact observations, player-time advancement, hunger/status ticks,
-environment ticks, item recharge/auto-ID, terrain effects, and vision updates,
-but skips monster AI scheduling and presentation-only post-vision work.
+These rows were run with `profile envspeed` phase timing, explicit benchmark
+action modes, optional `BROGUE_PROFILE=1` Brogue counters, the compact bridge
+observation path, map-only compact observations, compact mode sidebar elision,
+the bridge/server fast-input path, and the dirty-cell compact map cache. The
+most relevant column for simulation speed is `Env-step SPS/core`: it is
+computed from Puffer's `EVAL_ENV_STEP` timer, so GPU/copy time is excluded.
 
 Command shape:
 
@@ -61,7 +59,8 @@ Additional Brogue action modes:
 | Env/action stream | Threads | Obs bytes | Rollout ms | Puffer gpu/copy ms | Puffer env-step ms | Wall SPS | Env-step SPS/core |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Brogue fixed action 18 (`s` search) | 1 | 2407 | 3063.86 | 295.48 | 2763.41 | 5347 | 5929 |
-| Brogue random action ids `[0,8)`, compact fast turns | 1 | 2407 | 437.07 | 31.65 | 403.17 | 37486 | 40639 |
+| Brogue random action ids `[0,8)`, faithful simulation | 1 | 2407 | 2746.14 | 16.49 | 2726.04 | 5966 | 6008 |
+| Brogue random action ids `[0,8)`, `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1` | 1 | 2407 | 396.66 | 10.01 | 384.55 | 41304 | 42604 |
 | NLE random action ids `[0,8)` | 1 | 1659 | 272.94 | 31.48 | 238.86 | 60027 | 68591 |
 
 Single-core simulation gap at this shape:
@@ -70,10 +69,13 @@ Single-core simulation gap at this shape:
 - NLE zero-action headline: `~847k` env-step SPS/core
 - zero-action gap: `~6.0x`
 - Brogue fixed search trace: `~5.9k` env-step SPS/core
-- Brogue bounded movement-random trace with compact fast turns: `~40.6k`
+- Brogue bounded movement-random trace with faithful simulation: `~6.0k`
   env-step SPS/core
+- Brogue bounded movement-random trace with explicit lossy compact simulation
+  shortcuts: `~42.6k` env-step SPS/core
 - NLE bounded random trace: `~68.6k` env-step SPS/core
-- movement-random gap: `~1.7x`
+- faithful movement-random gap: `~11.4x`
+- lossy shortcut movement-random gap: `~1.6x`
 
 For NLE, total wall throughput is GPU/copy limited at this small 64-agent
 shape. For Brogue, total wall throughput is CPU simulation limited.
@@ -154,14 +156,14 @@ Additional movement-random sub-zones:
 
 Conclusion: the full observation explains the apparent "100x bigger" number,
 but it is not the current default-path bottleneck. Compact observation fill is
-now `~0.3 us/step` in steady state, and sidebar refresh has been removed
-from the compact benchmark path. Bridge fast input removes input-loop prep from
-the benchmark path. Before compact fast turns, legal movement was dominated by
+now sub-microsecond in steady state, and sidebar refresh has been removed from
+the compact benchmark path. Bridge fast input removes input-loop prep from the
+benchmark path. With faithful simulation, legal movement is still dominated by
 Brogue turn simulation, especially vision/FOV/light bookkeeping, scent, monster
-scheduling, and remaining bridge coroutine/control-flow overhead. Compact fast
-turns remove the monster scheduler from the Puffer training benchmark path and
-move bounded movement-random from `~14.5k` to `~40.6k` env-step SPS/core, which
-is within `2x` of the same-harness NLE random baseline.
+scheduling, environment updates, and remaining bridge coroutine/control-flow
+overhead. The compact fast-turn shortcut can move bounded movement-random into
+the same range as NLE, but it skips core mechanics and is now explicitly
+opt-in only.
 
 The first targeted optimization was to skip terminal flushes in bridge/server
 mode. `commitDraws()` only pushes `displayBuffer` to the terminal backend; the
@@ -197,12 +199,11 @@ transition lists. That moved the clean bounded movement-random sample to
 `~14.5k` env-step SPS/core. A direct compact `executeEvent()` path was tested
 and rejected because it segfaulted under the Puffer multi-env shared-library
 setup; the coroutine path remains the stable bridge.
-The ninth targeted set added compact fast turns: compact mode now advances
-player time, hunger/status/environment ticks, item recharge/auto-ID, terrain
-effects, and vision while skipping monster AI scheduling and presentation-only
-post-vision work. That moved bounded movement-random to a clean `~40.6k`
-env-step SPS/core sample, with repeated clean env-step samples in the
-`~40.4k-43.9k` range.
+The ninth targeted set added compact fast turns and demonstrated that skipping
+monster scheduling could move bounded movement-random to the `~40k` env-step
+SPS/core range. That is no longer the default environment because it changes
+game semantics. It is gated behind `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1` for
+diagnostic benchmarking only.
 
 ## Build Commands
 

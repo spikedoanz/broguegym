@@ -56,21 +56,11 @@ Implemented:
   Brogue updates the compact map cache from `refreshDungeonCell()` in compact
   mode, and observation fill is a steady-state memcpy plus stat packing.
 - bridge profiling now splits `updateVision`, `updateLighting`, and
-  `updateEnvironment` into sub-zones, and compact mode skips terminal-only
-  display-detail lighting work plus glowing terrain lights outside the player
-  FOV.
-- compact movement now reuses the current player FOV for miner light, caches
-  fixed light distances, limits gas work to active bounds/candidates, caches
-  gas-obstruction terrain flags, and uses tracked cell lists for several
-  environment phases.
-- compact mode skips terminal display-buffer refresh work, rolling waypoint
-  refreshes, terrain-glow painting, and gas/promotion/fire environment
-  simulation in the Puffer training path.
-- compact vision uses previous-FOV/visible transition lists and skips the
-  telepathy full-map pass when no telepathy state is active.
-- compact training fast turns advance player time, hunger/status/environment
-  ticks, item recharge/auto-ID, terrain effects, and vision while skipping
-  monster AI scheduling and presentation-only post-vision work.
+  `updateEnvironment` into sub-zones.
+- compact mode skips terminal display-buffer refresh work in the Puffer path.
+- lossy compact simulation shortcuts were tested for benchmarking, but are now
+  gated behind `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1` and are not the default
+  playable environment.
 - explicit `profile envspeed` action modes:
   `--action-mode zero|fixed|random`, `--action-id`, and `--action-limit`.
 
@@ -85,10 +75,13 @@ threads=1, horizon=256`:
 Additional Brogue traces:
 
 - fixed action 18 (`s` search): `~5.9k` env-step SPS/core
-- deterministic random action ids `[0,8)` with compact fast turns: `~40.6k`
+- deterministic random action ids `[0,8)` with faithful simulation: `~6.0k`
   env-step SPS/core
+- deterministic random action ids `[0,8)` with
+  `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1`: `~42.6k` env-step SPS/core
 - NLE deterministic random action ids `[0,8)`: `~68.6k` env-step SPS/core
-- deterministic movement-random gap with compact fast turns: `~1.7x`
+- deterministic movement-random gap with faithful simulation: `~11.4x`
+- deterministic movement-random gap with lossy shortcuts: `~1.6x`
 - unrestricted random over all 60 Brogue actions can enter prompt/menu paths
   and did not complete promptly; keep it out of headline benchmark numbers
   until prompt auto-dismiss/classification is implemented.
@@ -99,8 +92,8 @@ input, and the dirty-cell compact map cache:
 
 - zero-action wrapper `c_step`: `~12 us/step`
 - fixed search wrapper `c_step`: `~190 us/step`
-- bounded random movement wrapper `c_step` with compact fast turns:
-  `~25 us/step`
+- bounded random movement wrapper `c_step` with faithful simulation:
+  `~167 us/step`
 - compact bridge observation fill: `~0.2-0.4 us/step`
 - full bridge observation fill: removed from the default Puffer path
 - compact Puffer pack: `~0.1-0.3 us/step`
@@ -121,19 +114,19 @@ Observation conclusion:
   Puffer default path, and sidebar refresh has been removed from the compact
   path; bridge input prep has also been removed for direct keyboard actions.
   The remaining full-simulation legal-action bottleneck is Brogue's
-  turn/render-refresh work. The compact training benchmark now reaches the
-  target by skipping monster AI scheduling in compact fast turns.
+  turn/render-refresh work. The shortcut benchmark reaches the target by
+  skipping monster AI scheduling, but that path is opt-in only and should not be
+  used as the playable environment.
 
 Current hot zones:
 
 - Zero-action: bridge resume, compact observation fill, and keystroke dispatch
   dominate; the zero-action gap is much smaller than before.
 - Fixed search: many pause callbacks remain, but terminal flush cost is gone.
-- Bounded movement-random: with full compact turn scheduling, `playerTurnEnded`
-  still dominates. With compact fast turns enabled, the same Puffer benchmark
-  is within `2x` of NLE; the remaining work is to decide whether to preserve
-  that training shortcut or replace it with a faster exact active-monster
-  scheduler.
+- Bounded movement-random: with faithful compact turn scheduling,
+  `playerTurnEnded` still dominates. The remaining work is to replace the
+  shortcut result with exact optimizations such as active-monster scheduling and
+  incremental scent/vision updates.
 
 ## Concrete Next Implementation Plan
 
@@ -146,11 +139,10 @@ Priority order from the current profile:
    path. The current implementation keeps a compact semantic map cache updated
    from dirty dungeon-cell refreshes, so the compact policy observation no
    longer depends on the terminal `displayBuffer`.
-3. Decide the production stance for compact fast turns. The benchmark target is
-   met with this training shortcut, but exact monster AI scheduling is skipped.
-   If exact simulation is required, replace the shortcut with an active-monster
-   scheduler and incremental scent updates; if training throughput is the
-   priority, keep the shortcut and expose it as the documented compact profile.
+3. Keep faithful simulation as the default. Compact fast turns are an explicit
+   diagnostic shortcut only. To meet the benchmark target for the real
+   environment, replace the shortcut with exact optimizations such as an
+   active-monster scheduler and incremental scent updates.
 4. Replace private shared-library isolation with a true per-env game context
    after the scalar hot path is no longer dominated by easy UI work. This is
    required for NLE-like memory footprint and reset architecture, but it is not
@@ -162,18 +154,17 @@ Near-term acceptance gates:
 - `BROGUE_PROFILE=1` shows compact observation fill reduced to sub-microsecond
   steady-state cost. Done.
 - bounded movement-random reaches at least half of NLE's same-harness
-  env-step SPS/core. Done with compact fast turns; current clean result is
-  `~40.6k` versus NLE `~68.6k`.
+  env-step SPS/core without changing game semantics. Not done; current faithful
+  result is `~6.0k` versus NLE `~68.6k`.
 - every benchmark row is reported from the same Puffer `profile envspeed`
   command shape as NLE.
 
 ## Current Facts
 
-- Brogue Puffer compact movement steps are around 40.6k env-step SPS/core after
-  terminal flush, sidebar, input-prep, compact-observation cache, compact
-  display, compact waypoint, compact terrain-glow, compact environment,
-  compact visibility, gas, environment-list, light-distance work, compact
-  unlit visibility, and compact fast turns.
+- Brogue Puffer compact movement steps are around `6.0k` env-step SPS/core with
+  faithful simulation after terminal flush, sidebar, input-prep, and
+  compact-observation cache work. The old `~40k` result requires opt-in lossy
+  compact simulation shortcuts.
 - Brogue full observation is 155,032 bytes, but `*-no-obs` benchmarks show that
   observation fill/export is not the main gap for legal actions.
 - NetHack Puffer chars-only observation is 1,659 bytes. In the same
@@ -479,20 +470,16 @@ Performance gates:
 - Completed dirty-cell compact map cache: compact observation fill is
   sub-microsecond in steady state; zero-action env-step throughput is now
   `~87.8k` SPS/core and bounded random movement is now `~3.81k` SPS/core.
-- Completed compact-mode lighting filter and profile split: `lighting_tile_glow`
-  drops from about `52 us/step` to `14 us/step`; bounded random movement now
-  reaches `~4.16k` env-step SPS/core.
-- Completed compact movement hot-path pass: compact miner light reuses current
-  FOV, gas diffusion runs over active bounds, fire/bookkeeping/fire-propagation
-  environment phases use tracked cell lists, and compact visibility transitions
-  avoid the full display pass when special senses are inactive. Bounded random
-  movement now has a clean `~5.9k` env-step SPS/core sample, with observed noise
-  in the `~5.4-5.9k` range.
+- Completed compact-mode profile split and observation/display cleanup. Bounded
+  random movement with faithful simulation is now about `~6.0k` env-step
+  SPS/core.
 - Next gate, turn-loop optimization: named Brogue-internal timers explain
   `api.step`, then bounded random movement moves materially beyond the current
-  `~5.9k` env-step SPS/core.
-- Final: Brogue is within 2x of NLE's `EVAL_ENV_STEP` SPS/core in the same
-  `profile envspeed` matrix.
+  `~6.0k` env-step SPS/core without changing game semantics.
+- Diagnostic only: `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1` can reach the
+  `~40k` env-step SPS/core range by changing game semantics.
+- Final target: Brogue is within 2x of NLE's `EVAL_ENV_STEP` SPS/core in the
+  same `profile envspeed` matrix with faithful simulation.
 
 ## Work Order
 
@@ -511,15 +498,17 @@ Completed:
     longer rescans all map cells or depends on the terminal display buffer.
 11. Add expanded turn-loop profile zones and compact-mode lighting filtering
     for non-observed glowing terrain/display-detail work.
+12. Move lossy compact simulation shortcuts behind
+    `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1`; faithful simulation is the default.
 
 Next concrete work:
 
 1. Optimize true time-advancing movement from the current `BROGUE_PROFILE=1`
-   timers. Random `[0,8)` now reaches `~5.9k` env-step SPS/core and is
+   timers. Random `[0,8)` now reaches `~6.0k` env-step SPS/core and is
    dominated by `playerTurnEnded`, `updateVision`, and `updateEnvironment`;
    the largest named sub-zones are now `env_gas`, `lighting_tile_glow`,
    `env_promotions`, and `lighting_miner`.
-   Acceptance: bounded random movement moves materially beyond `5.9k`
+   Acceptance: bounded random movement moves materially beyond `6.0k`
    env-step SPS/core.
 2. Classify the zero-action path. If repeated `k` is mostly wall-bump/no-turn,
    add a cheap prompt/no-advance path comparable to NLE's auto-dismiss/no-advance
@@ -531,8 +520,8 @@ Next concrete work:
    benchmarking.
 4. Continue true time-advancing movement optimization. Likely
    targets are display refresh work that is unnecessary for compact obs,
-   repeated map/lighting recomputation, and monster/environment updates that can
-   be skipped or batched when the agent only needs policy observations.
+   repeated map/lighting recomputation, and exact active-set approaches for
+   monster/environment updates.
    Acceptance: fixed legal movement/search/rest traces improve, not just the
    zero-action benchmark.
 5. Replace private shared-library isolation with an NLE-style `BrogueCtx`.
@@ -543,4 +532,4 @@ Next concrete work:
    improve.
 6. Run the full NetHack-vs-Brogue Puffer benchmark matrix and report both wall
    SPS and `EVAL_ENV_STEP` SPS/core. The final gate remains within 2x of NLE's
-   CPU simulation SPS/core in the same harness.
+   CPU simulation SPS/core in the same harness with faithful simulation.
