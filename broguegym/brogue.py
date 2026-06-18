@@ -289,7 +289,7 @@ class _InProcessBrogue:
         raise BackendUnavailableError(BackendErrorCode.BRIDGE_OPERATION_FAILED, msg)
 
 
-_BRIDGE_ABI_VERSION = 8
+_BRIDGE_ABI_VERSION = 9
 _SCREEN_COLS = 100
 _SCREEN_ROWS = 34
 _MAP_COLS = 79
@@ -472,6 +472,13 @@ def _configure_library(library: Any) -> None:
         ctypes.c_int,
     ]
     library.brh_env_step.restype = ctypes.c_int
+    library.brh_env_step_no_observation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_long,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    library.brh_env_step_no_observation.restype = ctypes.c_int
     library.brh_env_step_from_buffers.argtypes = [ctypes.c_void_p]
     library.brh_env_step_from_buffers.restype = ctypes.c_int
     library.brh_env_num_agents.argtypes = [ctypes.c_void_p]

@@ -54,6 +54,7 @@ typedef struct brh_env_buffers {
 typedef brh_env *(*env_create_fn)(const brh_env_buffers *buffers);
 typedef int (*env_reset_fn)(brh_env *env, uint64_t seed);
 typedef int (*env_step_fn)(brh_env *env, long key, int control, int shift);
+typedef int (*env_step_no_observation_fn)(brh_env *env, long key, int control, int shift);
 typedef int (*env_num_agents_fn)(const brh_env *env);
 typedef void (*env_close_fn)(brh_env *env);
 
@@ -74,6 +75,7 @@ typedef struct bridge_api {
     env_create_fn env_create;
     env_reset_fn env_reset;
     env_step_fn env_step;
+    env_step_no_observation_fn env_step_no_observation;
     env_num_agents_fn env_num_agents;
     env_close_fn env_close;
 } bridge_api;
@@ -270,9 +272,11 @@ static void run_unmeasured_warmup(const bridge_api *api,
                                   long key,
                                   int control,
                                   int shift,
+                                  int no_observation,
                                   int warmup,
                                   uint64_t seed,
                                   void *observation,
+                                  float *terminals,
                                   size_t program_state_offset) {
     int rc = api->env_reset(env, seed);
     if (rc != 0) {
@@ -282,12 +286,17 @@ static void run_unmeasured_warmup(const bridge_api *api,
 
     int resets = 0;
     for (int i = 0; i < warmup; i++) {
-        rc = api->env_step(env, key, control, shift);
+        if (no_observation) {
+            rc = api->env_step_no_observation(env, key, control, shift);
+        } else {
+            rc = api->env_step(env, key, control, shift);
+        }
         if (rc < 0) {
             fprintf(stderr, "%s warmup step failed at %d: %s\n", label, i, api->last_error());
             exit(2);
         }
-        if (terminated(observation, program_state_offset)) {
+        if ((no_observation && terminals[0] != 0.0f)
+            || (!no_observation && terminated(observation, program_state_offset))) {
             resets++;
             rc = api->env_reset(env, seed + (uint64_t) resets);
             if (rc != 0) {
@@ -304,9 +313,11 @@ static trial_result run_step_trial(const bridge_api *api,
                                    long key,
                                    int control,
                                    int shift,
+                                   int no_observation,
                                    int target_steps,
                                    uint64_t seed,
                                    void *observation,
+                                   float *terminals,
                                    size_t program_state_offset) {
     trial_result result = {0, 0.0, 0, 0};
     int rc = api->env_reset(env, seed);
@@ -317,14 +328,19 @@ static trial_result run_step_trial(const bridge_api *api,
 
     double start = now_seconds();
     for (int i = 0; i < target_steps; i++) {
-        rc = api->env_step(env, key, control, shift);
+        if (no_observation) {
+            rc = api->env_step_no_observation(env, key, control, shift);
+        } else {
+            rc = api->env_step(env, key, control, shift);
+        }
         if (rc < 0) {
             fprintf(stderr, "%s step failed at %d: %s\n", label, i, api->last_error());
             exit(2);
         }
         result.steps++;
         result.invalid += (rc == 1);
-        if (terminated(observation, program_state_offset)) {
+        if ((no_observation && terminals[0] != 0.0f)
+            || (!no_observation && terminated(observation, program_state_offset))) {
             result.terminated = 1;
             break;
         }
@@ -385,6 +401,7 @@ static void benchmark_steps(const bridge_api *api,
                             long key,
                             int control,
                             int shift,
+                            int no_observation,
                             int target_steps,
                             int warmup,
                             int trace_repeats,
@@ -392,6 +409,7 @@ static void benchmark_steps(const bridge_api *api,
                             uint64_t seed_start,
                             uint64_t case_seed,
                             void *observation,
+                            float *terminals,
                             size_t program_state_offset) {
     int sample_count = trace_repeats * seed_count;
     trial_result *results = (trial_result *) calloc((size_t) sample_count, sizeof(trial_result));
@@ -406,9 +424,11 @@ static void benchmark_steps(const bridge_api *api,
                           key,
                           control,
                           shift,
+                          no_observation,
                           warmup,
                           (case_seed + seed_start) ^ 0x9e3779b97f4a7c15ULL,
                           observation,
+                          terminals,
                           program_state_offset);
 
     int result_index = 0;
@@ -421,9 +441,11 @@ static void benchmark_steps(const bridge_api *api,
                                                      key,
                                                      control,
                                                      shift,
+                                                     no_observation,
                                                      target_steps,
                                                      seed,
                                                      observation,
+                                                     terminals,
                                                      program_state_offset);
         }
     }
@@ -554,6 +576,10 @@ int main(int argc, char **argv) {
     api.env_create = (env_create_fn) must_symbol(handle, "brh_env_create");
     api.env_reset = (env_reset_fn) must_symbol(handle, "brh_env_reset");
     api.env_step = (env_step_fn) must_symbol(handle, "brh_env_step");
+    api.env_step_no_observation = (env_step_no_observation_fn) must_symbol(
+        handle,
+        "brh_env_step_no_observation"
+    );
     api.env_num_agents = (env_num_agents_fn) must_symbol(handle, "brh_env_num_agents");
     api.env_close = (env_close_fn) must_symbol(handle, "brh_env_close");
 
@@ -599,8 +625,8 @@ int main(int argc, char **argv) {
     printf("profile: %s fixed trace lengths\n", profile->name);
     printf("seed count: %d; trace repeats per seed: %d\n", seed_count, trace_repeats);
     printf("tail_us is p95 for >=20 samples, otherwise max\n");
-    printf("step cases use scalar BrogueEnv ABI and include full observation fill/export\n");
-    printf("no fill-only baseline: current bridge ABI exposes no observation-export-only call\n");
+    printf("step cases use scalar BrogueEnv ABI; *-no-obs skips full observation fill/export\n");
+    printf("copy-only is a memcpy floor, not a fill-only semantic baseline\n");
     printf("\n");
     printf("%-14s  %8s  %5s  %7s  %7s  %8s  %8s  %8s  %10s  %7s  %5s  %7s\n",
            "case",
@@ -618,11 +644,16 @@ int main(int argc, char **argv) {
     printf("----------------------------------------------------------------------------------------------------------------\n");
 
     benchmark_copy_only(expected.observation_size, profile->copy_count, trace_repeats);
-    benchmark_steps(&api, env, "invalid-key", '!', 0, 0, profile->invalid_steps, profile->invalid_warmup, trace_repeats, seed_count, seed_start, 1, observation, expected.program_state_offset);
-    benchmark_steps(&api, env, "rest", 'z', 0, 0, profile->rest_steps, profile->rest_warmup, trace_repeats, seed_count, seed_start, 1001, observation, expected.program_state_offset);
-    benchmark_steps(&api, env, "search", 's', 0, 0, profile->search_steps, profile->search_warmup, trace_repeats, seed_count, seed_start, 2001, observation, expected.program_state_offset);
-    benchmark_steps(&api, env, "explore", 'x', 0, 0, profile->explore_steps, profile->explore_warmup, trace_repeats, seed_count, seed_start, 3001, observation, expected.program_state_offset);
-    benchmark_steps(&api, env, "fast-explore", 'x', 1, 0, profile->fast_explore_steps, profile->fast_explore_warmup, trace_repeats, seed_count, seed_start, 4001, observation, expected.program_state_offset);
+    benchmark_steps(&api, env, "invalid-key", '!', 0, 0, 0, profile->invalid_steps, profile->invalid_warmup, trace_repeats, seed_count, seed_start, 1, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "invalid-no-obs", '!', 0, 0, 1, profile->invalid_steps, profile->invalid_warmup, trace_repeats, seed_count, seed_start, 101, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "rest", 'z', 0, 0, 0, profile->rest_steps, profile->rest_warmup, trace_repeats, seed_count, seed_start, 1001, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "rest-no-obs", 'z', 0, 0, 1, profile->rest_steps, profile->rest_warmup, trace_repeats, seed_count, seed_start, 1101, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "search", 's', 0, 0, 0, profile->search_steps, profile->search_warmup, trace_repeats, seed_count, seed_start, 2001, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "search-no-obs", 's', 0, 0, 1, profile->search_steps, profile->search_warmup, trace_repeats, seed_count, seed_start, 2101, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "explore", 'x', 0, 0, 0, profile->explore_steps, profile->explore_warmup, trace_repeats, seed_count, seed_start, 3001, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "explore-no-obs", 'x', 0, 0, 1, profile->explore_steps, profile->explore_warmup, trace_repeats, seed_count, seed_start, 3101, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "fast-explore", 'x', 1, 0, 0, profile->fast_explore_steps, profile->fast_explore_warmup, trace_repeats, seed_count, seed_start, 4001, observation, terminals, expected.program_state_offset);
+    benchmark_steps(&api, env, "fastx-no-obs", 'x', 1, 0, 1, profile->fast_explore_steps, profile->fast_explore_warmup, trace_repeats, seed_count, seed_start, 4101, observation, terminals, expected.program_state_offset);
     benchmark_resets(&api, env, profile->reset_count, trace_repeats, seed_count, seed_start);
 
     api.env_close(env);
@@ -686,6 +717,47 @@ def git_status(root: Path) -> str:
     return f"dirty ({len(lines)} status lines)"
 
 
+def git_dirty_flag(root: Path) -> str:
+    """Return tracked/untracked dirty counts for one git checkout."""
+
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"unknown:{exc}"
+    lines = output.splitlines()
+    if not lines:
+        return "clean"
+    tracked = sum(1 for line in lines if not line.startswith("??"))
+    untracked = len(lines) - tracked
+    return f"dirty:{tracked}T/{untracked}U"
+
+
+def git_commit_flag(root: Path) -> str:
+    """Return branch, short commit, and dirty state for benchmark output."""
+
+    branch = command_first_line(["git", "branch", "--show-current"], cwd=root)
+    commit = command_first_line(["git", "rev-parse", "--short", "HEAD"], cwd=root)
+    if branch == "unavailable":
+        branch = "detached"
+    return f"{branch}@{commit}[{git_dirty_flag(root)}]"
+
+
+def benchmark_commit_flags(root: Path) -> str:
+    """Return commit flags for the repo and relevant submodules."""
+
+    parts = [f"broguegym={git_commit_flag(root)}"]
+    for name in ("BrogueCE", "broguegym-dev"):
+        checkout = root / name
+        if checkout.is_dir():
+            parts.append(f"{name}={git_commit_flag(checkout)}")
+    return " ".join(parts)
+
+
 def print_provenance(cc: str, library: Path) -> None:
     """Print run metadata that affects benchmark comparability."""
 
@@ -694,6 +766,7 @@ def print_provenance(cc: str, library: Path) -> None:
     modified = datetime.fromtimestamp(library_stat.st_mtime).isoformat(timespec="seconds")
     print("Benchmark provenance")
     print(f"repo: {command_first_line(['git', 'rev-parse', '--short', 'HEAD'], cwd=root)} {git_status(root)}")
+    print(f"commit flags: {benchmark_commit_flags(root)}")
     print(f"system: {platform.platform()} ({platform.machine()})")
     print(f"python: {platform.python_version()}")
     print(f"harness compiler: {cc}")
