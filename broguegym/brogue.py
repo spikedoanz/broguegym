@@ -111,6 +111,21 @@ class _InProcessBrogue:
         self.library_path = _default_library_path()
         self.data_dir = _default_data_dir()
         self._library: Any | None = None
+        self._env_handle: Any | None = None
+        self._observation = _CObservation()
+        self._actions = (ctypes.c_long * 1)()
+        self._controls = (ctypes.c_uint8 * 1)()
+        self._shifts = (ctypes.c_uint8 * 1)()
+        self._rewards = (ctypes.c_float * 1)()
+        self._terminals = (ctypes.c_float * 1)()
+        self._env_buffers = _CEnvBuffers(
+            ctypes.pointer(self._observation),
+            self._actions,
+            self._controls,
+            self._shifts,
+            self._rewards,
+            self._terminals,
+        )
         self._state = BackendSessionState.CLOSED
 
     def reset(
@@ -124,17 +139,17 @@ class _InProcessBrogue:
         self._validate_data_dir()
         if self._state is BackendSessionState.RUNNING:
             self.close()
-        observation = _CObservation()
         library = self._load_library()
         library.brh_set_data_dir(str(self.data_dir).encode("utf-8"))
-        rc = library.brh_reset(seed_value, ctypes.byref(observation))
+        env_handle = self._ensure_env_handle()
+        rc = library.brh_env_reset(env_handle, seed_value)
         try:
             self._raise_if_failed(rc, "reset")
         except BackendUnavailableError:
-            self._state = BackendSessionState.CLOSED
+            self.close()
             raise
         self._state = BackendSessionState.RUNNING
-        observation_dict = _observation_from_c(observation)
+        observation_dict = _observation_from_c(self._observation)
         actual_seed = int(observation_dict["program_state"][_PROGRAM_SEED_INDEX])
         return BackendReset(
             observation=observation_dict,
@@ -157,19 +172,18 @@ class _InProcessBrogue:
             raise BackendUnavailableError(BackendErrorCode.BRIDGE_NOT_RUNNING, msg)
 
         key = _bridge_key(brogue_input.key)
-        observation = _CObservation()
         library = self._require_library()
-        rc = library.brh_step(
+        rc = library.brh_env_step(
+            self._require_env_handle(),
             key,
             int(brogue_input.control),
             int(brogue_input.shift),
-            ctypes.byref(observation),
         )
         if rc < 0:
             self._raise_if_failed(rc, "step")
         status = _bridge_step_status(rc)
-        observation_dict = _observation_from_c(observation)
-        terminated = bool(observation_dict["program_state"][_PROGRAM_TERMINATED_INDEX])
+        observation_dict = _observation_from_c(self._observation)
+        terminated = bool(self._terminals[0])
         info: InfoDict = {
             BackendInfoKey.KEY: brogue_input.key,
             BackendInfoKey.CONTROL: brogue_input.control,
@@ -203,9 +217,10 @@ class _InProcessBrogue:
     def close(self) -> None:
         """Stop the current Brogue session, if one is running."""
 
-        if self._state is BackendSessionState.RUNNING:
-            self._require_library().brh_close()
-            self._state = BackendSessionState.CLOSED
+        if self._env_handle is not None:
+            self._require_library().brh_env_close(self._env_handle)
+            self._env_handle = None
+        self._state = BackendSessionState.CLOSED
 
     def __enter__(self) -> _InProcessBrogue:
         return self
@@ -243,6 +258,22 @@ class _InProcessBrogue:
             raise RuntimeError(msg)
         return self._library
 
+    def _ensure_env_handle(self) -> Any:
+        if self._env_handle is not None:
+            return self._env_handle
+        library = self._require_library()
+        handle = library.brh_env_create(ctypes.byref(self._env_buffers))
+        if handle is None:
+            self._raise_if_failed(-1, "create env")
+        self._env_handle = handle
+        return handle
+
+    def _require_env_handle(self) -> Any:
+        if self._env_handle is None:
+            msg = "BrogueEnv handle is not available despite a running session"
+            raise RuntimeError(msg)
+        return self._env_handle
+
     def _validate_data_dir(self) -> None:
         if not self.data_dir.is_dir():
             msg = f"Brogue data directory does not exist: {self.data_dir}"
@@ -258,7 +289,7 @@ class _InProcessBrogue:
         raise BackendUnavailableError(BackendErrorCode.BRIDGE_OPERATION_FAILED, msg)
 
 
-_BRIDGE_ABI_VERSION = 7
+_BRIDGE_ABI_VERSION = 8
 _SCREEN_COLS = 100
 _SCREEN_ROWS = 34
 _MAP_COLS = 79
@@ -275,7 +306,6 @@ _PROGRAM_STATE_SIZE = 8
 _INVENTORY_SIZE = 26
 _INVENTORY_STR_LENGTH = 80
 _INVENTORY_STR_CELLS = _INVENTORY_SIZE * _INVENTORY_STR_LENGTH
-_PROGRAM_TERMINATED_INDEX = 1
 _PROGRAM_SEED_INDEX = 4
 _GYM_ZERO_BRIDGE_SEED = 0x9E3779B97F4A7C15
 _PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -322,6 +352,17 @@ class _CObservation(ctypes.Structure):
         ("blstats", ctypes.c_int64 * _BLSTATS_SIZE),
         ("message", ctypes.c_uint8 * _MESSAGE_SIZE),
         ("program_state", ctypes.c_uint64 * _PROGRAM_STATE_SIZE),
+    ]
+
+
+class _CEnvBuffers(ctypes.Structure):
+    _fields_ = [
+        ("observations", ctypes.POINTER(_CObservation)),
+        ("actions", ctypes.POINTER(ctypes.c_long)),
+        ("controls", ctypes.POINTER(ctypes.c_uint8)),
+        ("shifts", ctypes.POINTER(ctypes.c_uint8)),
+        ("rewards", ctypes.POINTER(ctypes.c_float)),
+        ("terminals", ctypes.POINTER(ctypes.c_float)),
     ]
 
 
@@ -420,6 +461,23 @@ def _configure_library(library: Any) -> None:
     library.brh_set_data_dir.restype = None
     library.brh_last_error.argtypes = []
     library.brh_last_error.restype = ctypes.c_char_p
+    library.brh_env_create.argtypes = [ctypes.POINTER(_CEnvBuffers)]
+    library.brh_env_create.restype = ctypes.c_void_p
+    library.brh_env_reset.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    library.brh_env_reset.restype = ctypes.c_int
+    library.brh_env_step.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_long,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    library.brh_env_step.restype = ctypes.c_int
+    library.brh_env_step_from_buffers.argtypes = [ctypes.c_void_p]
+    library.brh_env_step_from_buffers.restype = ctypes.c_int
+    library.brh_env_num_agents.argtypes = [ctypes.c_void_p]
+    library.brh_env_num_agents.restype = ctypes.c_int
+    library.brh_env_close.argtypes = [ctypes.c_void_p]
+    library.brh_env_close.restype = None
 
 
 def _validate_bridge_abi(library: Any) -> None:

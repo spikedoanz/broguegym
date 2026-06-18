@@ -42,6 +42,20 @@ typedef int (*reset_fn)(uint64_t seed, void *out);
 typedef int (*step_fn)(long key, int control, int shift, void *out);
 typedef void (*close_fn)(void);
 typedef const char *(*last_error_fn)(void);
+typedef struct brh_env brh_env;
+typedef struct brh_env_buffers {
+    void *observations;
+    long *actions;
+    unsigned char *controls;
+    unsigned char *shifts;
+    float *rewards;
+    float *terminals;
+} brh_env_buffers;
+typedef brh_env *(*env_create_fn)(const brh_env_buffers *buffers);
+typedef int (*env_reset_fn)(brh_env *env, uint64_t seed);
+typedef int (*env_step_fn)(brh_env *env, long key, int control, int shift);
+typedef int (*env_num_agents_fn)(const brh_env *env);
+typedef void (*env_close_fn)(brh_env *env);
 
 typedef struct bridge_api {
     set_data_dir_fn set_data_dir;
@@ -57,6 +71,11 @@ typedef struct bridge_api {
     step_fn step;
     close_fn close;
     last_error_fn last_error;
+    env_create_fn env_create;
+    env_reset_fn env_reset;
+    env_step_fn env_step;
+    env_num_agents_fn env_num_agents;
+    env_close_fn env_close;
 } bridge_api;
 
 typedef struct expected_abi {
@@ -246,6 +265,7 @@ static int terminated(const void *observation, size_t program_state_offset) {
 }
 
 static void run_unmeasured_warmup(const bridge_api *api,
+                                  brh_env *env,
                                   const char *label,
                                   long key,
                                   int control,
@@ -254,7 +274,7 @@ static void run_unmeasured_warmup(const bridge_api *api,
                                   uint64_t seed,
                                   void *observation,
                                   size_t program_state_offset) {
-    int rc = api->reset(seed, observation);
+    int rc = api->env_reset(env, seed);
     if (rc != 0) {
         fprintf(stderr, "%s warmup reset failed: %s\n", label, api->last_error());
         exit(2);
@@ -262,24 +282,24 @@ static void run_unmeasured_warmup(const bridge_api *api,
 
     int resets = 0;
     for (int i = 0; i < warmup; i++) {
-        rc = api->step(key, control, shift, observation);
+        rc = api->env_step(env, key, control, shift);
         if (rc < 0) {
             fprintf(stderr, "%s warmup step failed at %d: %s\n", label, i, api->last_error());
             exit(2);
         }
         if (terminated(observation, program_state_offset)) {
             resets++;
-            rc = api->reset(seed + (uint64_t) resets, observation);
+            rc = api->env_reset(env, seed + (uint64_t) resets);
             if (rc != 0) {
                 fprintf(stderr, "%s warmup reset failed: %s\n", label, api->last_error());
                 exit(2);
             }
         }
     }
-    api->close();
 }
 
 static trial_result run_step_trial(const bridge_api *api,
+                                   brh_env *env,
                                    const char *label,
                                    long key,
                                    int control,
@@ -289,7 +309,7 @@ static trial_result run_step_trial(const bridge_api *api,
                                    void *observation,
                                    size_t program_state_offset) {
     trial_result result = {0, 0.0, 0, 0};
-    int rc = api->reset(seed, observation);
+    int rc = api->env_reset(env, seed);
     if (rc != 0) {
         fprintf(stderr, "%s reset failed: %s\n", label, api->last_error());
         exit(2);
@@ -297,7 +317,7 @@ static trial_result run_step_trial(const bridge_api *api,
 
     double start = now_seconds();
     for (int i = 0; i < target_steps; i++) {
-        rc = api->step(key, control, shift, observation);
+        rc = api->env_step(env, key, control, shift);
         if (rc < 0) {
             fprintf(stderr, "%s step failed at %d: %s\n", label, i, api->last_error());
             exit(2);
@@ -310,7 +330,6 @@ static trial_result run_step_trial(const bridge_api *api,
         }
     }
     result.elapsed = now_seconds() - start;
-    api->close();
     return result;
 }
 
@@ -361,6 +380,7 @@ static void summarize_case(const char *label,
 }
 
 static void benchmark_steps(const bridge_api *api,
+                            brh_env *env,
                             const char *label,
                             long key,
                             int control,
@@ -381,6 +401,7 @@ static void benchmark_steps(const bridge_api *api,
     }
 
     run_unmeasured_warmup(api,
+                          env,
                           label,
                           key,
                           control,
@@ -395,6 +416,7 @@ static void benchmark_steps(const bridge_api *api,
         uint64_t seed = case_seed + seed_start + (uint64_t) seed_index;
         for (int repeat = 0; repeat < trace_repeats; repeat++) {
             results[result_index++] = run_step_trial(api,
+                                                     env,
                                                      label,
                                                      key,
                                                      control,
@@ -410,11 +432,11 @@ static void benchmark_steps(const bridge_api *api,
 }
 
 static void benchmark_resets(const bridge_api *api,
+                             brh_env *env,
                              int target_resets,
                              int trace_repeats,
                              int seed_count,
-                             uint64_t seed_start,
-                             void *observation) {
+                             uint64_t seed_start) {
     int sample_count = trace_repeats * seed_count;
     trial_result *results = (trial_result *) calloc((size_t) sample_count, sizeof(trial_result));
     if (results == NULL) {
@@ -429,14 +451,13 @@ static void benchmark_resets(const bridge_api *api,
             uint64_t seed_base = seed_start + 5001ULL + (uint64_t) seed_index * 1000003ULL;
             double start = now_seconds();
             for (int i = 0; i < target_resets; i++) {
-                int rc = api->reset(seed_base + (uint64_t) i, observation);
+                int rc = api->env_reset(env, seed_base + (uint64_t) i);
                 if (rc != 0) {
                     fprintf(stderr, "reset bench failed at %d: %s\n", i, api->last_error());
                     exit(2);
                 }
             }
             result.elapsed = now_seconds() - start;
-            api->close();
             results[result_index++] = result;
         }
     }
@@ -530,12 +551,44 @@ int main(int argc, char **argv) {
     api.step = (step_fn) must_symbol(handle, "brh_step");
     api.close = (close_fn) must_symbol(handle, "brh_close");
     api.last_error = (last_error_fn) must_symbol(handle, "brh_last_error");
+    api.env_create = (env_create_fn) must_symbol(handle, "brh_env_create");
+    api.env_reset = (env_reset_fn) must_symbol(handle, "brh_env_reset");
+    api.env_step = (env_step_fn) must_symbol(handle, "brh_env_step");
+    api.env_num_agents = (env_num_agents_fn) must_symbol(handle, "brh_env_num_agents");
+    api.env_close = (env_close_fn) must_symbol(handle, "brh_env_close");
 
     validate_bridge_abi(&api, &expected);
     api.set_data_dir(data_dir);
     void *observation = calloc(1, expected.observation_size);
     if (observation == NULL) {
         perror("calloc observation");
+        return 2;
+    }
+    long actions[1] = {0};
+    unsigned char controls[1] = {0};
+    unsigned char shifts[1] = {0};
+    float rewards[1] = {0.0f};
+    float terminals[1] = {0.0f};
+    brh_env_buffers buffers = {
+        observation,
+        actions,
+        controls,
+        shifts,
+        rewards,
+        terminals,
+    };
+    brh_env *env = api.env_create(&buffers);
+    if (env == NULL) {
+        fprintf(stderr, "brh_env_create failed: %s\n", api.last_error());
+        free(observation);
+        dlclose(handle);
+        return 2;
+    }
+    if (api.env_num_agents(env) != 1) {
+        fprintf(stderr, "brh_env_num_agents returned %d; expected 1\n", api.env_num_agents(env));
+        api.env_close(env);
+        free(observation);
+        dlclose(handle);
         return 2;
     }
 
@@ -546,7 +599,7 @@ int main(int argc, char **argv) {
     printf("profile: %s fixed trace lengths\n", profile->name);
     printf("seed count: %d; trace repeats per seed: %d\n", seed_count, trace_repeats);
     printf("tail_us is p95 for >=20 samples, otherwise max\n");
-    printf("step cases include full observation fill and export\n");
+    printf("step cases use scalar BrogueEnv ABI and include full observation fill/export\n");
     printf("no fill-only baseline: current bridge ABI exposes no observation-export-only call\n");
     printf("\n");
     printf("%-14s  %8s  %5s  %7s  %7s  %8s  %8s  %8s  %10s  %7s  %5s  %7s\n",
@@ -565,13 +618,14 @@ int main(int argc, char **argv) {
     printf("----------------------------------------------------------------------------------------------------------------\n");
 
     benchmark_copy_only(expected.observation_size, profile->copy_count, trace_repeats);
-    benchmark_steps(&api, "invalid-key", '!', 0, 0, profile->invalid_steps, profile->invalid_warmup, trace_repeats, seed_count, seed_start, 1, observation, expected.program_state_offset);
-    benchmark_steps(&api, "rest", 'z', 0, 0, profile->rest_steps, profile->rest_warmup, trace_repeats, seed_count, seed_start, 1001, observation, expected.program_state_offset);
-    benchmark_steps(&api, "search", 's', 0, 0, profile->search_steps, profile->search_warmup, trace_repeats, seed_count, seed_start, 2001, observation, expected.program_state_offset);
-    benchmark_steps(&api, "explore", 'x', 0, 0, profile->explore_steps, profile->explore_warmup, trace_repeats, seed_count, seed_start, 3001, observation, expected.program_state_offset);
-    benchmark_steps(&api, "fast-explore", 'x', 1, 0, profile->fast_explore_steps, profile->fast_explore_warmup, trace_repeats, seed_count, seed_start, 4001, observation, expected.program_state_offset);
-    benchmark_resets(&api, profile->reset_count, trace_repeats, seed_count, seed_start, observation);
+    benchmark_steps(&api, env, "invalid-key", '!', 0, 0, profile->invalid_steps, profile->invalid_warmup, trace_repeats, seed_count, seed_start, 1, observation, expected.program_state_offset);
+    benchmark_steps(&api, env, "rest", 'z', 0, 0, profile->rest_steps, profile->rest_warmup, trace_repeats, seed_count, seed_start, 1001, observation, expected.program_state_offset);
+    benchmark_steps(&api, env, "search", 's', 0, 0, profile->search_steps, profile->search_warmup, trace_repeats, seed_count, seed_start, 2001, observation, expected.program_state_offset);
+    benchmark_steps(&api, env, "explore", 'x', 0, 0, profile->explore_steps, profile->explore_warmup, trace_repeats, seed_count, seed_start, 3001, observation, expected.program_state_offset);
+    benchmark_steps(&api, env, "fast-explore", 'x', 1, 0, profile->fast_explore_steps, profile->fast_explore_warmup, trace_repeats, seed_count, seed_start, 4001, observation, expected.program_state_offset);
+    benchmark_resets(&api, env, profile->reset_count, trace_repeats, seed_count, seed_start);
 
+    api.env_close(env);
     free(observation);
     dlclose(handle);
     return 0;

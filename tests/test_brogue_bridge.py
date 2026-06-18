@@ -12,7 +12,9 @@ from broguegym.brogue import (
     BackendErrorCode,
     BackendInfoKey,
     _InProcessBrogue,
+    _CEnvBuffers,
     _CObservation,
+    _configure_library,
     _default_library_path,
     _observation_from_c,
 )
@@ -71,6 +73,41 @@ def test_bridge_exports_unicode_codepoints_in_chars_if_built() -> None:
 
     assert library.glyphToUnicode(G_TRAP) == U_DIAMOND
     assert library.glyphToUnicode(G_BLOODWORT_STALK) == U_ARIES
+
+
+def test_brogue_env_scalar_abi_guards_single_instance_if_built() -> None:
+    library_path = _default_library_path()
+    if not library_path.exists():
+        pytest.skip("run through uv so package sync builds the bridge")
+
+    library = ctypes.CDLL(str(library_path))
+    _configure_library(library)
+
+    observation = _CObservation()
+    actions = (ctypes.c_long * 1)()
+    controls = (ctypes.c_uint8 * 1)()
+    shifts = (ctypes.c_uint8 * 1)()
+    rewards = (ctypes.c_float * 1)()
+    terminals = (ctypes.c_float * 1)()
+    buffers = _CEnvBuffers(
+        ctypes.pointer(observation),
+        actions,
+        controls,
+        shifts,
+        rewards,
+        terminals,
+    )
+
+    env = library.brh_env_create(ctypes.byref(buffers))
+    assert env is not None
+    try:
+        assert library.brh_env_num_agents(env) == 1
+        rejected = library.brh_env_create(ctypes.byref(buffers))
+        assert rejected is None
+        error = library.brh_last_error().decode("utf-8")
+        assert "only one live BrogueEnv" in error
+    finally:
+        library.brh_env_close(env)
 
 
 def test_brogue_bridge_drives_one_bridge_session_if_built() -> None:
