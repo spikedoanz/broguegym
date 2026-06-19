@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
+broguegym-play = "broguegym.compact_cli:main"
 broguegym-compact-play = "broguegym.compact_cli:main"
 
 [dependency-groups]
