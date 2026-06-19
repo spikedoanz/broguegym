@@ -7,33 +7,39 @@ These results use Puffer's native `profile envspeed` path:
 - `static_vec_reset`
 - timed `static_vec_omp_step`
 
-The Brogue Puffer env uses a compact byte observation by default:
+The Brogue Puffer env now uses the full bridge observation by default:
+
+- full terminal glyphs/chars/colors/specials
+- semantic map layers, flags, light, item, and monster tensors
+- inventory presence, letters, strings, item categories/kinds/quantities/flags,
+  enchantments, and charges
+- message text
+- blstats and program state
+- total: `155,032` bytes
+
+That full default observation is `93.4x` the current NLE chars-only observation
+(`1659` bytes), which is the source of the "100x bigger" number.
+
+The compact observation remains available only as an explicit build-time
+ablation with `build.sh brogue --compact-obs`:
 
 - map chars: `79 * 29 = 2291` bytes
 - blstats: `21 * int32 = 84` bytes
 - program state: `8 * int32 = 32` bytes
 - total: `2407` bytes
 
-The full bridge observation is still `155,032` bytes. That is `93.4x` the
-current NLE chars-only observation (`1659` bytes), which is the source of the
-"100x bigger" number. The Puffer policy observation is not using that full
-payload by default; its Brogue observation is now only `1.45x` NLE.
-
 Fidelity correction: compact observation no longer implies compact simulation
-shortcuts. The default `brh_step_compact` path now keeps full Brogue turn,
-monster, lighting, and environment simulation. The earlier compact fast-turn
-path is available only as an explicit lossy benchmark mode by setting
-`BROGUE_COMPACT_SIMULATION_SHORTCUTS=1`; it should not be treated as the
-playable agent environment.
+shortcuts. Full observation is the default. Compact observation and
+`BROGUE_COMPACT_SIMULATION_SHORTCUTS=1` are diagnostic profiles only; neither
+should be treated as the playable agent environment.
 
 ## Latest Same-Harness Results
 
 These rows were run with `profile envspeed` phase timing, explicit benchmark
-action modes, optional `BROGUE_PROFILE=1` Brogue counters, the compact bridge
-observation path, map-only compact observations, compact mode sidebar elision,
-the bridge/server fast-input path, and the dirty-cell compact map cache. The
-most relevant column for simulation speed is `Env-step SPS/core`: it is
-computed from Puffer's `EVAL_ENV_STEP` timer, so GPU/copy time is excluded.
+action modes, optional `BROGUE_PROFILE=1` Brogue counters, and the full
+observation restored as the default. The most relevant column for simulation
+speed is `Env-step SPS/core`: it is computed from Puffer's `EVAL_ENV_STEP`
+timer, so GPU/copy time is excluded.
 
 Command shape:
 
@@ -51,30 +57,37 @@ LD_LIBRARY_PATH=$PWD/vendor/nle/src/build:$LD_LIBRARY_PATH \
 
 | Env | Threads | Obs bytes | Rollout ms | Puffer gpu/copy ms | Puffer env-step ms | Wall SPS | Env-step SPS/core |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Brogue zero action | 1 | 2407 | 149.90 | 31.01 | 116.42 | 109301 | 140730 |
+| Brogue zero action, full observation | 1 | 155032 | 2354.64 | 195.38 | 2153.54 | 6958 | 7608 |
 | NLE zero action | 1 | 1659 | 62.80 | 41.73 | 19.35 | 260879 | 846718 |
 
 Additional Brogue action modes:
 
 | Env/action stream | Threads | Obs bytes | Rollout ms | Puffer gpu/copy ms | Puffer env-step ms | Wall SPS | Env-step SPS/core |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Brogue fixed action 18 (`s` search) | 1 | 2407 | 3063.86 | 295.48 | 2763.41 | 5347 | 5929 |
-| Brogue random action ids `[0,8)`, faithful simulation | 1 | 2407 | 2746.14 | 16.49 | 2726.04 | 5966 | 6008 |
-| Brogue random action ids `[0,8)`, `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1` | 1 | 2407 | 396.66 | 10.01 | 384.55 | 41304 | 42604 |
+| Brogue random action ids `[0,8)`, full observation | 1 | 155032 | 6683.95 | 195.83 | 6481.34 | 2451 | 2528 |
 | NLE random action ids `[0,8)` | 1 | 1659 | 272.94 | 31.48 | 238.86 | 60027 | 68591 |
+
+Diagnostic/ablation rows, not default:
+
+| Env/action stream | Threads | Obs bytes | Rollout ms | Puffer gpu/copy ms | Puffer env-step ms | Wall SPS | Env-step SPS/core |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Brogue random action ids `[0,8)`, compact observation, faithful simulation | 1 | 2407 | 2746.14 | 16.49 | 2726.04 | 5966 | 6008 |
+| Brogue random action ids `[0,8)`, compact observation, `BROGUE_COMPACT_SIMULATION_SHORTCUTS=1` | 1 | 2407 | 396.66 | 10.01 | 384.55 | 41304 | 42604 |
 
 Single-core simulation gap at this shape:
 
-- Brogue zero-action headline: `~141k` env-step SPS/core
+- Brogue zero-action headline with full observation: `~7.6k` env-step SPS/core
 - NLE zero-action headline: `~847k` env-step SPS/core
-- zero-action gap: `~6.0x`
-- Brogue fixed search trace: `~5.9k` env-step SPS/core
-- Brogue bounded movement-random trace with faithful simulation: `~6.0k`
+- zero-action gap: `~111x`
+- Brogue bounded movement-random trace with full observation: `~2.5k`
   env-step SPS/core
+- Brogue bounded movement-random trace with compact observation and faithful
+  simulation: `~6.0k` env-step SPS/core
 - Brogue bounded movement-random trace with explicit lossy compact simulation
   shortcuts: `~42.6k` env-step SPS/core
 - NLE bounded random trace: `~68.6k` env-step SPS/core
-- faithful movement-random gap: `~11.4x`
+- full-observation faithful movement-random gap: `~27.1x`
+- compact-observation faithful movement-random gap: `~11.4x`
 - lossy shortcut movement-random gap: `~1.6x`
 
 For NLE, total wall throughput is GPU/copy limited at this small 64-agent
@@ -154,16 +167,17 @@ Additional movement-random sub-zones:
 | `monsters_turn` inclusive | 3.51 us/step |
 | `env_bookkeeping` inclusive | 0.03 us/step |
 
-Conclusion: the full observation explains the apparent "100x bigger" number,
-but it is not the current default-path bottleneck. Compact observation fill is
-now sub-microsecond in steady state, and sidebar refresh has been removed from
-the compact benchmark path. Bridge fast input removes input-loop prep from the
-benchmark path. With faithful simulation, legal movement is still dominated by
-Brogue turn simulation, especially vision/FOV/light bookkeeping, scent, monster
-scheduling, environment updates, and remaining bridge coroutine/control-flow
-overhead. The compact fast-turn shortcut can move bounded movement-random into
-the same range as NLE, but it skips core mechanics and is now explicitly
-opt-in only.
+Conclusion: the full observation explains the apparent "100x bigger" number
+and is now intentionally back on the default path. Restoring the full payload
+brings inventory, messages, colors, full screen state, and semantic map tensors
+back into Puffer observations, but it materially reduces throughput versus the
+compact ablation. With faithful simulation and full observation, legal movement
+is dominated by both Brogue turn simulation and full observation export/copy:
+vision/FOV/light bookkeeping, scent, monster scheduling, environment updates,
+bridge coroutine/control-flow overhead, and the 155 KiB observation payload all
+matter. The compact fast-turn shortcut can move bounded movement-random into
+the same range as NLE, but it skips core mechanics and is explicitly opt-in
+only.
 
 The first targeted optimization was to skip terminal flushes in bridge/server
 mode. `commitDraws()` only pushes `displayBuffer` to the terminal backend; the
@@ -305,21 +319,17 @@ NETHACKDIR=$PWD/vendor/nle/src/build/dat \
 Brogue now benchmarks inside Puffer with the same `envspeed` harness as NLE and
 supports many envs in one process through private shared-library copies.
 
-The compact Brogue observation is `2407` bytes, about `1.45x` NLE's `1659` byte
-chars-only observation. The full bridge observation is about `93x` NLE's
-observation, but that full payload is not the Puffer default.
+The full Brogue observation is `155,032` bytes, about `93x` NLE's `1659` byte
+chars-only observation, and that full payload is now the Puffer default. The
+compact `2407` byte observation remains available only as an explicit ablation.
 
-At `total_agents=64, threads=1`, the CPU simulation rate from Puffer's
-`EVAL_ENV_STEP` bucket is about `84.5k` SPS/core for Brogue zero-action and
-`878k` SPS/core for NLE zero-action. The remaining single-core zero-action
-simulation gap is about `10.4x`. Brogue fixed search is now about `5.44k`
-SPS/core; bounded movement-random is about `4.16k` SPS/core. NLE bounded
-movement-random is about `70.4k` SPS/core, a `~16.9x` gap.
+At `total_agents=64, threads=1`, the CPU env-step bucket is about `7.6k`
+SPS/core for Brogue zero-action with full observation and `846.7k` SPS/core for
+NLE zero-action. Brogue bounded movement-random with full observation is about
+`2.5k` SPS/core versus NLE's `68.6k` SPS/core, a `~27x` gap.
 
-The bridge handoff and observation copy are not the dominant legal-step costs.
-After terminal flushes, sidebar refresh, input-loop prep, compact observation
-rescans, and compact-only lighting work were removed from compact bridge mode,
-movement is dominated by Brogue game logic: `playerTurnEnded`,
-`updateEnvironment`, and the remaining pieces of `updateVision`. The next
-performance targets are gas/environment bookkeeping and incremental
-vision/environment updates.
+The next performance target is no longer to hide information from the agent.
+Keep full observations and faithful simulation as the default; optimize exact
+game logic and full-observation packing/copy paths separately. Compact rows are
+useful only as ablations to quantify how much of the gap is observation payload
+versus Brogue simulation.

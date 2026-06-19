@@ -208,10 +208,11 @@ support measuring smaller observation profiles than the current full
    Current measurements show this is still slow for valid actions, so the next
    target is the pthread bridge/game/render loop rather than Python interop.
 
-3. **Add compact observation profiles**
+3. **Keep full observation as the default and add compact ablations**
 
-   Do not make the default policy path fill the 155 KiB full observation. Add
-   explicit profiles, for example:
+   The default policy path should fill the full 155 KiB observation so the agent
+   sees inventory, messages, colors, map semantics, and terminal state. Add
+   explicit compact profiles only as ablations, for example:
 
    - `none`: step only
    - `screen`: screen chars/glyph ids only
@@ -219,7 +220,8 @@ support measuring smaller observation profiles than the current full
    - `full`: current raw `brh_observation`
 
    The C API should make the selected profile explicit at env creation or step
-   time. Puffer should start on `screen` or `core`, not `full`.
+   time. Puffer should start on `full`; `screen` and `core` are diagnostic
+   profiles.
 
 4. **Port registered/caller-owned buffer filling onto the scalar ABI**
 
@@ -258,7 +260,8 @@ support measuring smaller observation profiles than the current full
 
 - Direct C benchmark reports separate timings for no-observation, screen/core,
   and full observation profiles.
-- Compact policy observation is materially faster than full observation.
+- Compact policy observation is materially faster than full observation, but is
+  not the default playable observation.
 - Python scalar backend can use the compact/direct-buffer path without per-step
   full-dict allocation.
 - We have a defensible scalar throughput number before starting `N > 1`.
@@ -378,10 +381,10 @@ These steps should wait until the `N=1` scalar path is acceptable.
    Start with `total_agents = 1`, then run `total_agents = 2` in sequential CPU
    mode, then raise `num_threads` after correctness is stable.
 
-8. **Add packed observations**
+8. **Add packed observation ablations**
 
-   Do not feed Puffer the full `brh_observation` as the default policy input.
-   Add C packers for compact `ByteTensor` observations, initially something like:
+   Feed Puffer the full `brh_observation` as the default policy input. Add C
+   packers only for compact `ByteTensor` ablations, initially something like:
 
    - screen chars or glyph ids
    - basic stats
