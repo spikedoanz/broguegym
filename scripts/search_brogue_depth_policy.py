@@ -194,6 +194,7 @@ class PolicyState:
     blocked_cells: set[tuple[int, int]] = field(default_factory=set)
     tried_items: set[tuple[int, str]] = field(default_factory=set)
     last_action: str = ""
+    no_progress_count: int = 0
     trace: list[str] = field(default_factory=list)
 
     def clear_path(self) -> None:
@@ -416,6 +417,15 @@ def adjacent_monster_count(obs: ObservationDict) -> int:
     return count
 
 
+def nearest_visible_monster_distance(obs: ObservationDict) -> int | None:
+    player = player_position(obs)
+    monsters = visible_monsters(obs)
+    if not monsters:
+        return None
+    px, py = player
+    return min(max(abs(px - mx), abs(py - my)) for mx, my in monsters)
+
+
 def down_stair_targets(obs: ObservationDict) -> set[tuple[int, int]]:
     targets: set[tuple[int, int]] = set()
     ys, xs = np.where(obs["map_layers"][:, :, 0] == DOWN_STAIRS)
@@ -539,6 +549,10 @@ def choose_action(
     if "game over" in msg or "press any key" in msg and "stop" not in msg:
         state.clear_path()
         return " "
+    if state.no_progress_count >= 3:
+        state.action_queue.clear()
+        state.clear_path()
+        return "\x1b" if state.no_progress_count % 2 else " "
 
     px, py = player_position(obs)
     dungeon, _liquid, _gas, _surface = terrain_layers(obs, px, py)
@@ -672,7 +686,8 @@ def choose_avoidance_action(
     if state.pending_path and state.path_mode == "avoid":
         return state.pending_path.pop(0)
 
-    if visible_monsters(obs):
+    nearest_monster = nearest_visible_monster_distance(obs)
+    if nearest_monster is not None and nearest_monster <= 2:
         adjacent_attack = adjacent_attack_direction(obs)
         if adjacent_attack is not None and hp_fraction(obs) >= 0.45:
             state.clear_path()
@@ -824,8 +839,10 @@ def update_policy_state(
     state.last_message = message_text(after)
     if after_depth == before_depth and after_turn == before_turn and after_pos == before_pos:
         state.no_change_steps += 1
+        policy.no_progress_count += 1
     else:
         state.no_change_steps = 0
+        policy.no_progress_count = 0
 
     if after_depth != before_depth:
         policy.reset_level_state()
