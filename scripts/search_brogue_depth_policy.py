@@ -74,21 +74,23 @@ CHASM: Final = 89
 LAVA: Final = 93
 LAVA_RETRACTABLE: Final = 94
 LAVA_RETRACTING: Final = 95
-BRIDGE: Final = 100
-STONE_BRIDGE: Final = 103
-HOLE: Final = 108
-FORCEFIELD: Final = 132
-PLAIN_FIRE: Final = 138
-CREATURE_FIRE: Final = 145
-SACRIFICE_LAVA: Final = 154
-STATUE_INERT_DOORWAY: Final = 157
-STATUE_DORMANT_DOORWAY: Final = 158
-CHASM_WITH_HIDDEN_BRIDGE: Final = 159
-CHASM_WITH_HIDDEN_BRIDGE_ACTIVE: Final = 160
-RAT_TRAP_WALL_DORMANT: Final = 162
-RAT_TRAP_WALL_CRACKING: Final = 163
-WORM_TUNNEL_OUTER_WALL: Final = 168
-MUD_WALL: Final = 173
+BRIDGE: Final = 101
+STONE_BRIDGE: Final = 104
+HOLE: Final = 112
+SPIDERWEB: Final = 140
+NETTING: Final = 141
+FORCEFIELD: Final = 147
+PLAIN_FIRE: Final = 160
+CREATURE_FIRE: Final = 167
+SACRIFICE_LAVA: Final = 195
+STATUE_INERT_DOORWAY: Final = 198
+STATUE_DORMANT_DOORWAY: Final = 199
+CHASM_WITH_HIDDEN_BRIDGE: Final = 200
+CHASM_WITH_HIDDEN_BRIDGE_ACTIVE: Final = 201
+RAT_TRAP_WALL_DORMANT: Final = 203
+RAT_TRAP_WALL_CRACKING: Final = 204
+WORM_TUNNEL_OUTER_WALL: Final = 210
+MUD_WALL: Final = 213
 
 BLOCKING_DUNGEON_TILES: Final = {
     NOTHING,
@@ -120,6 +122,8 @@ HAZARD_TILES: Final = {
     LAVA_RETRACTABLE,
     LAVA_RETRACTING,
     HOLE,
+    SPIDERWEB,
+    NETTING,
     PLAIN_FIRE,
     CREATURE_FIRE,
     SACRIFICE_LAVA,
@@ -238,6 +242,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--equip-items", action="store_true")
     parser.add_argument("--panic-items", action="store_true")
     parser.add_argument("--panic-min-depth", type=int, default=1)
+    parser.add_argument("--panic-scrolls", action="store_true")
+    parser.add_argument("--avoid-monsters-min-depth", type=int, default=0)
     parser.add_argument("--native-stairs", action="store_true")
     parser.add_argument("--trace-dir", type=Path)
     parser.add_argument("--stop-on-success", action="store_true")
@@ -364,9 +370,6 @@ def is_passable(obs: ObservationDict, x: int, y: int, *, avoid_hazards: bool = T
     if liquid == DEEP_WATER and avoid_hazards:
         return False
     if surface in {FORCEFIELD, PLAIN_FIRE, CREATURE_FIRE}:
-        return False
-    char = screen_char(obs, x, y)
-    if char in {ord("#"), ord(" ")} and dungeon not in {DOOR, OPEN_DOOR, LOCKED_DOOR}:
         return False
     return True
 
@@ -522,6 +525,8 @@ def choose_action(
     equip_items: bool,
     panic_items: bool,
     panic_min_depth: int,
+    panic_scrolls: bool,
+    avoid_monsters_min_depth: int,
     native_stairs: bool,
 ) -> str:
     if state.action_queue:
@@ -549,6 +554,7 @@ def choose_action(
         equip_items=equip_items,
         panic_items=panic_items,
         panic_min_depth=panic_min_depth,
+        panic_scrolls=panic_scrolls,
     )
     if survival_action is not None:
         return survival_action
@@ -574,6 +580,14 @@ def choose_action(
             state.path_mode = "stairs"
             state.path_target = None
             return path[0]
+
+    avoid_action = choose_avoidance_action(
+        obs,
+        state,
+        avoid_monsters_min_depth=avoid_monsters_min_depth,
+    )
+    if avoid_action is not None:
+        return avoid_action
 
     if state.pending_path:
         return state.pending_path.pop(0)
@@ -613,6 +627,7 @@ def choose_survival_action(
     equip_items: bool,
     panic_items: bool,
     panic_min_depth: int,
+    panic_scrolls: bool,
 ) -> str | None:
     hp_frac = hp_fraction(obs)
     depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
@@ -636,10 +651,88 @@ def choose_survival_action(
     ):
         return None
 
-    panic_action = choose_panic_item_action(obs, state)
+    panic_action = choose_panic_item_action(obs, state, include_scrolls=panic_scrolls)
     if panic_action is not None:
         return panic_action
     return None
+
+
+def choose_avoidance_action(
+    obs: ObservationDict,
+    state: PolicyState,
+    *,
+    avoid_monsters_min_depth: int,
+) -> str | None:
+    if avoid_monsters_min_depth <= 0:
+        return None
+    depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
+    if depth < avoid_monsters_min_depth:
+        return None
+
+    if state.pending_path and state.path_mode == "avoid":
+        return state.pending_path.pop(0)
+
+    if visible_monsters(obs):
+        adjacent_attack = adjacent_attack_direction(obs)
+        if adjacent_attack is not None and hp_fraction(obs) >= 0.45:
+            state.clear_path()
+            return adjacent_attack
+
+        flee_key = flee_direction(obs, state.blocked_cells)
+        if flee_key is not None:
+            state.clear_path()
+            return flee_key
+
+    frontiers = frontier_targets(obs, state.blocked_targets)
+    if frontiers:
+        path = bfs_path(obs, frontiers, avoid_danger=True, blocked_cells=state.blocked_cells)
+        if path:
+            state.pending_path = path[1:]
+            state.path_mode = "avoid"
+            state.path_target = path_endpoint(player_position(obs), path)
+            return path[0]
+
+    return None
+
+
+def adjacent_attack_direction(obs: ObservationDict) -> str | None:
+    px, py = player_position(obs)
+    best: tuple[int, str] | None = None
+    for dx, dy, key in DIRECTIONS:
+        nx = px + dx
+        ny = py + dy
+        if not in_bounds(nx, ny) or not has_monster(obs, nx, ny) or not visible(obs, nx, ny):
+            continue
+        hp = int(obs["map_monster_hp"][ny, nx])
+        if hp < 0:
+            hp = 9999
+        if best is None or hp < best[0]:
+            best = (hp, key)
+    return None if best is None else best[1]
+
+
+def flee_direction(obs: ObservationDict, blocked_cells: set[tuple[int, int]]) -> str | None:
+    px, py = player_position(obs)
+    monsters = visible_monsters(obs)
+    if not monsters:
+        return None
+    danger = dangerous_cells(obs)
+    best: tuple[int, str] | None = None
+    for dx, dy, key in DIRECTIONS:
+        nx = px + dx
+        ny = py + dy
+        if not in_bounds(nx, ny):
+            continue
+        if (nx, ny) in blocked_cells:
+            continue
+        if (nx, ny) in danger or has_monster(obs, nx, ny):
+            continue
+        if not is_passable(obs, nx, ny):
+            continue
+        score = min((nx - mx) * (nx - mx) + (ny - my) * (ny - my) for mx, my in monsters)
+        if best is None or score > best[0]:
+            best = (score, key)
+    return None if best is None else best[1]
 
 
 def choose_equipment_action(obs: ObservationDict, state: PolicyState) -> str | None:
@@ -676,8 +769,16 @@ def choose_equipment_action(obs: ObservationDict, state: PolicyState) -> str | N
     return "e"
 
 
-def choose_panic_item_action(obs: ObservationDict, state: PolicyState) -> str | None:
-    for category in (CHARM_CATEGORY, POTION_CATEGORY, SCROLL_CATEGORY):
+def choose_panic_item_action(
+    obs: ObservationDict,
+    state: PolicyState,
+    *,
+    include_scrolls: bool,
+) -> str | None:
+    categories = [CHARM_CATEGORY, POTION_CATEGORY]
+    if include_scrolls:
+        categories.append(SCROLL_CATEGORY)
+    for category in categories:
         for slot in inventory_slots(obs, category):
             letter = item_letter(obs, slot)
             if not letter:
@@ -844,6 +945,8 @@ def run_search(args: argparse.Namespace) -> list[EpisodeState]:
                     equip_items=args.equip_items,
                     panic_items=args.panic_items,
                     panic_min_depth=args.panic_min_depth,
+                    panic_scrolls=args.panic_scrolls,
+                    avoid_monsters_min_depth=args.avoid_monsters_min_depth,
                     native_stairs=args.native_stairs,
                 )
                 episode.policy.last_action = key
