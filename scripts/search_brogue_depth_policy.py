@@ -209,7 +209,8 @@ KEY_ACTIONS: Final = {
     ".": Action.keypress("."),
     "\n": Action.keypress("\n"),
     "\x1b": Action.keypress("\x1b"),
-    "x": Action.keypress("x", control=True),
+    "x": Action.keypress("x"),
+    "^x": Action.keypress("x", control=True),
     "z": Action.keypress("z"),
     "a": Action.keypress("a"),
     "e": Action.keypress("e"),
@@ -279,6 +280,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=4096)
     parser.add_argument("--target-depth", type=int, default=10)
     parser.add_argument("--auto-retries", type=int, default=2)
+    parser.add_argument("--fast-autoexplore", action="store_true")
+    parser.add_argument("--descend-min-hp-frac", type=float, default=0.0)
     parser.add_argument("--max-no-change-steps", type=int, default=64)
     parser.add_argument("--progress-interval", type=int, default=64)
     parser.add_argument("--rest-hp-frac", type=float, default=0.0)
@@ -290,14 +293,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panic-scrolls-min-depth", type=int, default=8)
     parser.add_argument("--panic-zaps", action="store_true")
     parser.add_argument("--panic-zaps-min-depth", type=int, default=8)
+    parser.add_argument("--panic-ranged-first", action="store_true")
     parser.add_argument("--reuse-offensive-zaps", action="store_true")
     parser.add_argument("--reuse-offensive-zaps-min-depth", type=int, default=9)
+    parser.add_argument("--reuse-offensive-zaps-max-hp-frac", type=float, default=1.0)
     parser.add_argument("--panic-throws", action="store_true")
     parser.add_argument("--panic-throws-min-depth", type=int, default=6)
     parser.add_argument("--panic-throw-radius", type=int, default=6)
     parser.add_argument("--panic-near-radius", type=int, default=-1)
     parser.add_argument("--escape-active-hazards", action="store_true")
     parser.add_argument("--avoid-monsters-min-depth", type=int, default=0)
+    parser.add_argument("--retreat-upstairs-min-depth", type=int, default=0)
+    parser.add_argument("--retreat-upstairs-max-hp-frac", type=float, default=0.45)
     parser.add_argument("--adjacent-attack-min-hp-frac", type=float, default=0.45)
     parser.add_argument("--cardinal-attack-fallback", action="store_true")
     parser.add_argument("--turn-aware-blocking", action="store_true")
@@ -305,6 +312,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-auto-near-monsters-min-depth", type=int, default=0)
     parser.add_argument("--no-auto-near-monsters-radius", type=int, default=12)
     parser.add_argument("--secret-search-min-depth", type=int, default=1)
+    parser.add_argument("--secret-search-before-frontiers-min-depth", type=int, default=0)
     parser.add_argument("--secret-search-max", type=int, default=0)
     parser.add_argument("--stuck-dive-min-depth", type=int, default=0)
     parser.add_argument("--stuck-dive-min-hp-frac", type=float, default=0.6)
@@ -520,6 +528,24 @@ def down_stair_targets(obs: ObservationDict) -> set[tuple[int, int]]:
     return targets
 
 
+def up_stair_targets(obs: ObservationDict) -> set[tuple[int, int]]:
+    targets: set[tuple[int, int]] = set()
+    ys, xs = np.where(obs["map_layers"][:, :, 0] == UP_STAIRS)
+    for y_np, x_np in zip(ys, xs, strict=True):
+        x = int(x_np)
+        y = int(y_np)
+        if known(obs, x, y):
+            targets.add((x, y))
+    screen = obs["chars"][SCREEN_MAP_Y0 : SCREEN_MAP_Y0 + MAP_ROWS, SCREEN_MAP_X0 : SCREEN_MAP_X0 + MAP_COLS]
+    ys, xs = np.where(screen == ord("<"))
+    for y_np, x_np in zip(ys, xs, strict=True):
+        x = int(x_np)
+        y = int(y_np)
+        if known(obs, x, y):
+            targets.add((x, y))
+    return targets
+
+
 def frontier_targets(obs: ObservationDict, blocked: set[tuple[int, int]]) -> set[tuple[int, int]]:
     targets: set[tuple[int, int]] = set()
     for y in range(MAP_ROWS):
@@ -643,6 +669,8 @@ def choose_action(
     state: PolicyState,
     *,
     auto_retries: int,
+    fast_autoexplore: bool,
+    descend_min_hp_frac: float,
     rest_hp_frac: float,
     rest_min_depth: int,
     equip_items: bool,
@@ -652,25 +680,32 @@ def choose_action(
     panic_scrolls_min_depth: int,
     panic_zaps: bool,
     panic_zaps_min_depth: int,
+    panic_ranged_first: bool,
     reuse_offensive_zaps: bool,
     reuse_offensive_zaps_min_depth: int,
+    reuse_offensive_zaps_max_hp_frac: float,
     panic_throws: bool,
     panic_throws_min_depth: int,
     panic_throw_radius: int,
     panic_near_radius: int,
     escape_active_hazards: bool,
     avoid_monsters_min_depth: int,
+    retreat_upstairs_min_depth: int,
+    retreat_upstairs_max_hp_frac: float,
     adjacent_attack_min_hp_frac: float,
     cardinal_attack_fallback: bool,
     center_biased_frontiers: bool,
     no_auto_near_monsters_min_depth: int,
     no_auto_near_monsters_radius: int,
     secret_search_min_depth: int,
+    secret_search_before_frontiers_min_depth: int,
     secret_search_max: int,
     stuck_dive_min_depth: int,
     stuck_dive_min_hp_frac: float,
     native_stairs: bool,
 ) -> str:
+    auto_key = "^x" if fast_autoexplore else "x"
+
     if state.action_queue:
         return state.action_queue.pop(0)
 
@@ -715,7 +750,7 @@ def choose_action(
 
     px, py = player_position(obs)
     dungeon, _liquid, _gas, _surface = terrain_layers(obs, px, py)
-    if dungeon == DOWN_STAIRS:
+    if dungeon == DOWN_STAIRS and hp_fraction(obs) >= descend_min_hp_frac:
         state.clear_path()
         return ">"
 
@@ -731,8 +766,10 @@ def choose_action(
         panic_scrolls_min_depth=panic_scrolls_min_depth,
         panic_zaps=panic_zaps,
         panic_zaps_min_depth=panic_zaps_min_depth,
+        panic_ranged_first=panic_ranged_first,
         reuse_offensive_zaps=reuse_offensive_zaps,
         reuse_offensive_zaps_min_depth=reuse_offensive_zaps_min_depth,
+        reuse_offensive_zaps_max_hp_frac=reuse_offensive_zaps_max_hp_frac,
         panic_throws=panic_throws,
         panic_throws_min_depth=panic_throws_min_depth,
         panic_throw_radius=panic_throw_radius,
@@ -741,6 +778,15 @@ def choose_action(
     )
     if survival_action is not None:
         return survival_action
+
+    retreat_action = choose_retreat_upstairs_action(
+        obs,
+        state,
+        retreat_upstairs_min_depth=retreat_upstairs_min_depth,
+        retreat_upstairs_max_hp_frac=retreat_upstairs_max_hp_frac,
+    )
+    if retreat_action is not None:
+        return retreat_action
 
     if state.pending_path and state.path_mode == "stairs":
         return state.pending_path.pop(0)
@@ -806,10 +852,24 @@ def choose_action(
     if avoid_action is not None:
         return avoid_action
 
+    depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
+    if (
+        secret_search_before_frontiers_min_depth > 0
+        and depth >= secret_search_before_frontiers_min_depth
+    ):
+        secret_action = choose_secret_search_action(
+            obs,
+            state,
+            search_max=secret_search_max,
+        )
+        if secret_action is not None:
+            return secret_action
+
     if state.pending_path:
         return state.pending_path.pop(0)
 
     auto_allowed = state.auto_failures < auto_retries
+    auto_blocked_by_monster = False
     if auto_allowed and no_auto_near_monsters_min_depth > 0:
         depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
         nearest = nearest_visible_monster_distance(obs)
@@ -819,9 +879,10 @@ def choose_action(
             and nearest <= no_auto_near_monsters_radius
         ):
             auto_allowed = False
+            auto_blocked_by_monster = True
     if auto_allowed:
         state.path_mode = "auto"
-        return "x"
+        return auto_key
 
     frontiers = frontier_targets(obs, state.blocked_targets)
     if frontiers:
@@ -847,7 +908,7 @@ def choose_action(
             return path[0]
         if path == []:
             state.search_count += 1
-            return "s" if state.search_count <= 4 else "x"
+            return "s" if state.search_count <= 4 or auto_blocked_by_monster else auto_key
 
     depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
     if depth >= secret_search_min_depth:
@@ -864,7 +925,7 @@ def choose_action(
         return "s"
     state.search_count = 0
     state.auto_failures = 0
-    return "x"
+    return "s" if auto_blocked_by_monster else auto_key
 
 
 def choose_survival_action(
@@ -880,8 +941,10 @@ def choose_survival_action(
     panic_scrolls_min_depth: int,
     panic_zaps: bool,
     panic_zaps_min_depth: int,
+    panic_ranged_first: bool,
     reuse_offensive_zaps: bool,
     reuse_offensive_zaps_min_depth: int,
+    reuse_offensive_zaps_max_hp_frac: float,
     panic_throws: bool,
     panic_throws_min_depth: int,
     panic_throw_radius: int,
@@ -934,7 +997,12 @@ def choose_survival_action(
         state,
         include_scrolls=panic_scrolls and depth >= panic_scrolls_min_depth,
         include_zaps=panic_zaps and depth >= panic_zaps_min_depth,
-        reuse_offensive_zaps=reuse_offensive_zaps and depth >= reuse_offensive_zaps_min_depth,
+        ranged_first=panic_ranged_first,
+        reuse_offensive_zaps=(
+            reuse_offensive_zaps
+            and depth >= reuse_offensive_zaps_min_depth
+            and hp_frac <= reuse_offensive_zaps_max_hp_frac
+        ),
     )
     if panic_action is not None:
         return panic_action
@@ -994,6 +1062,47 @@ def choose_avoidance_action(
             state.path_target = path_endpoint(player_position(obs), path)
             return path[0]
 
+    return None
+
+
+def choose_retreat_upstairs_action(
+    obs: ObservationDict,
+    state: PolicyState,
+    *,
+    retreat_upstairs_min_depth: int,
+    retreat_upstairs_max_hp_frac: float,
+) -> str | None:
+    if retreat_upstairs_min_depth <= 0:
+        return None
+    depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
+    if depth < retreat_upstairs_min_depth or hp_fraction(obs) > retreat_upstairs_max_hp_frac:
+        return None
+    if not visible_monsters(obs):
+        return None
+
+    px, py = player_position(obs)
+    dungeon, _liquid, _gas, _surface = terrain_layers(obs, px, py)
+    if dungeon == UP_STAIRS:
+        state.clear_path()
+        return "<"
+
+    if state.pending_path and state.path_mode == "retreat":
+        return state.pending_path.pop(0)
+
+    stairs = up_stair_targets(obs)
+    if not stairs:
+        return None
+    path = bfs_path(obs, stairs, avoid_danger=True, blocked_cells=state.blocked_cells)
+    if path is None:
+        path = bfs_path(obs, stairs, avoid_danger=False, blocked_cells=state.blocked_cells)
+    if path == []:
+        state.clear_path()
+        return "<"
+    if path:
+        state.pending_path = path[1:]
+        state.path_mode = "retreat"
+        state.path_target = path_endpoint(player_position(obs), path)
+        return path[0]
     return None
 
 
@@ -1297,19 +1406,45 @@ def choose_throw_action(obs: ObservationDict, state: PolicyState) -> str | None:
     return "t"
 
 
+def direction_to_nearest_visible_monster(obs: ObservationDict) -> str | None:
+    px, py = player_position(obs)
+    best: tuple[int, str] | None = None
+    for mx, my in visible_monsters(obs):
+        dx = 0 if mx == px else (1 if mx > px else -1)
+        dy = 0 if my == py else (1 if my > py else -1)
+        for dir_dx, dir_dy, key in DIRECTIONS:
+            if (dir_dx, dir_dy) != (dx, dy):
+                continue
+            distance = (mx - px) * (mx - px) + (my - py) * (my - py)
+            candidate = (distance, key)
+            if best is None or candidate < best:
+                best = candidate
+            break
+    return None if best is None else best[1]
+
+
 def choose_panic_item_action(
     obs: ObservationDict,
     state: PolicyState,
     *,
     include_scrolls: bool,
     include_zaps: bool,
+    ranged_first: bool,
     reuse_offensive_zaps: bool,
 ) -> str | None:
-    categories = [CHARM_CATEGORY, POTION_CATEGORY]
-    if include_zaps and visible_monsters(obs):
-        categories.append(STAFF_CATEGORY | WAND_CATEGORY)
-    if include_scrolls:
-        categories.append(SCROLL_CATEGORY)
+    if ranged_first:
+        categories = [CHARM_CATEGORY]
+        if include_zaps and visible_monsters(obs):
+            categories.append(STAFF_CATEGORY | WAND_CATEGORY)
+        if include_scrolls:
+            categories.append(SCROLL_CATEGORY)
+        categories.append(POTION_CATEGORY)
+    else:
+        categories = [CHARM_CATEGORY, POTION_CATEGORY]
+        if include_zaps and visible_monsters(obs):
+            categories.append(STAFF_CATEGORY | WAND_CATEGORY)
+        if include_scrolls:
+            categories.append(SCROLL_CATEGORY)
     for category in categories:
         for slot in inventory_slots(obs, category):
             letter = item_letter(obs, slot)
@@ -1322,6 +1457,7 @@ def choose_panic_item_action(
                 or "firebolt" in name
                 or "poison" in name
                 or "discord" in name
+                or "obstruction" in name
                 or "tunneling" in name
             )
             charges = int(obs["inventory_charges"][slot])
@@ -1336,7 +1472,15 @@ def choose_panic_item_action(
                 state.pending_item_prompt = "scroll"
                 state.action_queue.append(letter)
             elif category & (STAFF_CATEGORY | WAND_CATEGORY):
-                state.action_queue.extend([letter, "\n"])
+                direction = (
+                    direction_to_nearest_visible_monster(obs)
+                    if reusable_zap and "obstruction" in name
+                    else None
+                )
+                if direction is None:
+                    state.action_queue.extend([letter, "\n"])
+                else:
+                    state.action_queue.extend([letter, direction, "\n"])
             else:
                 state.action_queue.extend([letter, "\x1b"])
             return "a"
@@ -1456,7 +1600,7 @@ def update_policy_state(
         policy.reset_level_state()
         return
 
-    if action_key == "x":
+    if action_key in {"x", "^x"}:
         if after_turn == before_turn and after_pos == before_pos:
             policy.auto_failures += 1
         else:
@@ -1566,6 +1710,8 @@ def run_search(args: argparse.Namespace) -> list[EpisodeState]:
                     obs,
                     episode.policy,
                     auto_retries=args.auto_retries,
+                    fast_autoexplore=args.fast_autoexplore,
+                    descend_min_hp_frac=args.descend_min_hp_frac,
                     rest_hp_frac=args.rest_hp_frac,
                     rest_min_depth=args.rest_min_depth,
                     equip_items=args.equip_items,
@@ -1575,20 +1721,27 @@ def run_search(args: argparse.Namespace) -> list[EpisodeState]:
                     panic_scrolls_min_depth=args.panic_scrolls_min_depth,
                     panic_zaps=args.panic_zaps,
                     panic_zaps_min_depth=args.panic_zaps_min_depth,
+                    panic_ranged_first=args.panic_ranged_first,
                     reuse_offensive_zaps=args.reuse_offensive_zaps,
                     reuse_offensive_zaps_min_depth=args.reuse_offensive_zaps_min_depth,
+                    reuse_offensive_zaps_max_hp_frac=args.reuse_offensive_zaps_max_hp_frac,
                     panic_throws=args.panic_throws,
                     panic_throws_min_depth=args.panic_throws_min_depth,
                     panic_throw_radius=args.panic_throw_radius,
                     panic_near_radius=args.panic_near_radius,
                     escape_active_hazards=args.escape_active_hazards,
                     avoid_monsters_min_depth=args.avoid_monsters_min_depth,
+                    retreat_upstairs_min_depth=args.retreat_upstairs_min_depth,
+                    retreat_upstairs_max_hp_frac=args.retreat_upstairs_max_hp_frac,
                     adjacent_attack_min_hp_frac=args.adjacent_attack_min_hp_frac,
                     cardinal_attack_fallback=args.cardinal_attack_fallback,
                     center_biased_frontiers=args.center_biased_frontiers,
                     no_auto_near_monsters_min_depth=args.no_auto_near_monsters_min_depth,
                     no_auto_near_monsters_radius=args.no_auto_near_monsters_radius,
                     secret_search_min_depth=args.secret_search_min_depth,
+                    secret_search_before_frontiers_min_depth=(
+                        args.secret_search_before_frontiers_min_depth
+                    ),
                     secret_search_max=args.secret_search_max,
                     stuck_dive_min_depth=args.stuck_dive_min_depth,
                     stuck_dive_min_hp_frac=args.stuck_dive_min_hp_frac,
