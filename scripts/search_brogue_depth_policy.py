@@ -302,6 +302,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cardinal-attack-fallback", action="store_true")
     parser.add_argument("--turn-aware-blocking", action="store_true")
     parser.add_argument("--center-biased-frontiers", action="store_true")
+    parser.add_argument("--no-auto-near-monsters-min-depth", type=int, default=0)
+    parser.add_argument("--no-auto-near-monsters-radius", type=int, default=12)
+    parser.add_argument("--secret-search-min-depth", type=int, default=1)
     parser.add_argument("--secret-search-max", type=int, default=0)
     parser.add_argument("--stuck-dive-min-depth", type=int, default=0)
     parser.add_argument("--stuck-dive-min-hp-frac", type=float, default=0.6)
@@ -575,6 +578,7 @@ def bfs_path(
     *,
     avoid_danger: bool,
     avoid_hazards: bool = True,
+    allow_hazard_targets: bool = False,
     blocked_cells: set[tuple[int, int]] | None = None,
 ) -> list[str] | None:
     start = player_position(obs)
@@ -601,7 +605,8 @@ def bfs_path(
                 continue
             if has_monster(obs, nx, ny) and pos not in targets:
                 continue
-            if not is_passable(obs, nx, ny, avoid_hazards=avoid_hazards):
+            pos_avoid_hazards = avoid_hazards and not (allow_hazard_targets and pos in targets)
+            if not is_passable(obs, nx, ny, avoid_hazards=pos_avoid_hazards):
                 continue
             if dx and dy:
                 if (nx, y) in blocked or (x, ny) in blocked:
@@ -658,6 +663,9 @@ def choose_action(
     adjacent_attack_min_hp_frac: float,
     cardinal_attack_fallback: bool,
     center_biased_frontiers: bool,
+    no_auto_near_monsters_min_depth: int,
+    no_auto_near_monsters_radius: int,
+    secret_search_min_depth: int,
     secret_search_max: int,
     stuck_dive_min_depth: int,
     stuck_dive_min_hp_frac: float,
@@ -765,7 +773,8 @@ def choose_action(
                     obs,
                     dive_targets,
                     avoid_danger=True,
-                    avoid_hazards=False,
+                    avoid_hazards=True,
+                    allow_hazard_targets=True,
                     blocked_cells=state.blocked_cells,
                 )
                 if path is None:
@@ -773,7 +782,8 @@ def choose_action(
                         obs,
                         dive_targets,
                         avoid_danger=False,
-                        avoid_hazards=False,
+                        avoid_hazards=True,
+                        allow_hazard_targets=True,
                         blocked_cells=state.blocked_cells,
                     )
                 if path == []:
@@ -799,7 +809,17 @@ def choose_action(
     if state.pending_path:
         return state.pending_path.pop(0)
 
-    if state.auto_failures < auto_retries:
+    auto_allowed = state.auto_failures < auto_retries
+    if auto_allowed and no_auto_near_monsters_min_depth > 0:
+        depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
+        nearest = nearest_visible_monster_distance(obs)
+        if (
+            depth >= no_auto_near_monsters_min_depth
+            and nearest is not None
+            and nearest <= no_auto_near_monsters_radius
+        ):
+            auto_allowed = False
+    if auto_allowed:
         state.path_mode = "auto"
         return "x"
 
@@ -829,13 +849,15 @@ def choose_action(
             state.search_count += 1
             return "s" if state.search_count <= 4 else "x"
 
-    secret_action = choose_secret_search_action(
-        obs,
-        state,
-        search_max=secret_search_max,
-    )
-    if secret_action is not None:
-        return secret_action
+    depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
+    if depth >= secret_search_min_depth:
+        secret_action = choose_secret_search_action(
+            obs,
+            state,
+            search_max=secret_search_max,
+        )
+        if secret_action is not None:
+            return secret_action
 
     state.search_count += 1
     if state.search_count <= 6:
@@ -1564,6 +1586,9 @@ def run_search(args: argparse.Namespace) -> list[EpisodeState]:
                     adjacent_attack_min_hp_frac=args.adjacent_attack_min_hp_frac,
                     cardinal_attack_fallback=args.cardinal_attack_fallback,
                     center_biased_frontiers=args.center_biased_frontiers,
+                    no_auto_near_monsters_min_depth=args.no_auto_near_monsters_min_depth,
+                    no_auto_near_monsters_radius=args.no_auto_near_monsters_radius,
+                    secret_search_min_depth=args.secret_search_min_depth,
                     secret_search_max=args.secret_search_max,
                     stuck_dive_min_depth=args.stuck_dive_min_depth,
                     stuck_dive_min_hp_frac=args.stuck_dive_min_hp_frac,
