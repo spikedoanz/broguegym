@@ -180,6 +180,11 @@ ITEM_CAN_BE_IDENTIFIED: Final = 1 << 8
 UNKNOWN_SHORT: Final = np.iinfo(np.int16).min
 STRENGTH_RE: Final = re.compile(r"<(\d+)>")
 
+MK_PINK_JELLY: Final = 12
+MK_ACID_JELLY: Final = 34
+MK_BLACK_JELLY: Final = 52
+JELLY_MONSTER_KINDS: Final = {MK_PINK_JELLY, MK_ACID_JELLY, MK_BLACK_JELLY}
+
 DIRECTIONS: Final = (
     (-1, 0, "h"),
     (1, 0, "l"),
@@ -281,12 +286,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-depth", type=int, default=10)
     parser.add_argument("--auto-retries", type=int, default=2)
     parser.add_argument("--fast-autoexplore", action="store_true")
+    parser.add_argument("--disable-auto-min-depth", type=int, default=0)
     parser.add_argument("--descend-min-hp-frac", type=float, default=0.0)
     parser.add_argument("--max-no-change-steps", type=int, default=64)
     parser.add_argument("--progress-interval", type=int, default=64)
     parser.add_argument("--rest-hp-frac", type=float, default=0.0)
     parser.add_argument("--rest-min-depth", type=int, default=1)
     parser.add_argument("--equip-items", action="store_true")
+    parser.add_argument("--safe-id-potions-min-depth", type=int, default=0)
+    parser.add_argument("--safe-id-scrolls-min-depth", type=int, default=0)
     parser.add_argument("--panic-items", action="store_true")
     parser.add_argument("--panic-min-depth", type=int, default=1)
     parser.add_argument("--panic-scrolls", action="store_true")
@@ -294,6 +302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panic-zaps", action="store_true")
     parser.add_argument("--panic-zaps-min-depth", type=int, default=8)
     parser.add_argument("--panic-ranged-first", action="store_true")
+    parser.add_argument("--avoid-zapping-jellies", action="store_true")
     parser.add_argument("--reuse-offensive-zaps", action="store_true")
     parser.add_argument("--reuse-offensive-zaps-min-depth", type=int, default=9)
     parser.add_argument("--reuse-offensive-zaps-max-hp-frac", type=float, default=1.0)
@@ -510,6 +519,18 @@ def nearest_visible_monster_distance(obs: ObservationDict) -> int | None:
     return min(max(abs(px - mx), abs(py - my)) for mx, my in monsters)
 
 
+def nearest_visible_monster_kind(obs: ObservationDict) -> int | None:
+    px, py = player_position(obs)
+    best: tuple[int, int] | None = None
+    for mx, my in visible_monsters(obs):
+        distance = max(abs(px - mx), abs(py - my))
+        kind = int(obs["map_monster_kind"][my, mx])
+        candidate = (distance, kind)
+        if best is None or candidate < best:
+            best = candidate
+    return None if best is None else best[1]
+
+
 def down_stair_targets(obs: ObservationDict) -> set[tuple[int, int]]:
     targets: set[tuple[int, int]] = set()
     ys, xs = np.where(obs["map_layers"][:, :, 0] == DOWN_STAIRS)
@@ -670,10 +691,13 @@ def choose_action(
     *,
     auto_retries: int,
     fast_autoexplore: bool,
+    disable_auto_min_depth: int,
     descend_min_hp_frac: float,
     rest_hp_frac: float,
     rest_min_depth: int,
     equip_items: bool,
+    safe_id_potions_min_depth: int,
+    safe_id_scrolls_min_depth: int,
     panic_items: bool,
     panic_min_depth: int,
     panic_scrolls: bool,
@@ -681,6 +705,7 @@ def choose_action(
     panic_zaps: bool,
     panic_zaps_min_depth: int,
     panic_ranged_first: bool,
+    avoid_zapping_jellies: bool,
     reuse_offensive_zaps: bool,
     reuse_offensive_zaps_min_depth: int,
     reuse_offensive_zaps_max_hp_frac: float,
@@ -705,11 +730,16 @@ def choose_action(
     native_stairs: bool,
 ) -> str:
     auto_key = "^x" if fast_autoexplore else "x"
+    depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
 
     if state.action_queue:
         return state.action_queue.pop(0)
 
     msg = message_text(obs).lower()
+    autoexplore_active = "exploring... press any key to stop" in msg
+    if disable_auto_min_depth > 0 and depth >= disable_auto_min_depth and autoexplore_active:
+        state.clear_path()
+        return "\x1b"
     if "press space" in msg or "--more--" in msg:
         state.clear_path()
         return " "
@@ -760,6 +790,8 @@ def choose_action(
         rest_hp_frac=rest_hp_frac,
         rest_min_depth=rest_min_depth,
         equip_items=equip_items,
+        safe_id_potions_min_depth=safe_id_potions_min_depth,
+        safe_id_scrolls_min_depth=safe_id_scrolls_min_depth,
         panic_items=panic_items,
         panic_min_depth=panic_min_depth,
         panic_scrolls=panic_scrolls,
@@ -767,6 +799,7 @@ def choose_action(
         panic_zaps=panic_zaps,
         panic_zaps_min_depth=panic_zaps_min_depth,
         panic_ranged_first=panic_ranged_first,
+        avoid_zapping_jellies=avoid_zapping_jellies,
         reuse_offensive_zaps=reuse_offensive_zaps,
         reuse_offensive_zaps_min_depth=reuse_offensive_zaps_min_depth,
         reuse_offensive_zaps_max_hp_frac=reuse_offensive_zaps_max_hp_frac,
@@ -852,7 +885,6 @@ def choose_action(
     if avoid_action is not None:
         return avoid_action
 
-    depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
     if (
         secret_search_before_frontiers_min_depth > 0
         and depth >= secret_search_before_frontiers_min_depth
@@ -869,9 +901,11 @@ def choose_action(
         return state.pending_path.pop(0)
 
     auto_allowed = state.auto_failures < auto_retries
-    auto_blocked_by_monster = False
+    auto_suppressed = False
+    if disable_auto_min_depth > 0 and depth >= disable_auto_min_depth:
+        auto_allowed = False
+        auto_suppressed = True
     if auto_allowed and no_auto_near_monsters_min_depth > 0:
-        depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
         nearest = nearest_visible_monster_distance(obs)
         if (
             depth >= no_auto_near_monsters_min_depth
@@ -879,7 +913,7 @@ def choose_action(
             and nearest <= no_auto_near_monsters_radius
         ):
             auto_allowed = False
-            auto_blocked_by_monster = True
+            auto_suppressed = True
     if auto_allowed:
         state.path_mode = "auto"
         return auto_key
@@ -908,7 +942,7 @@ def choose_action(
             return path[0]
         if path == []:
             state.search_count += 1
-            return "s" if state.search_count <= 4 or auto_blocked_by_monster else auto_key
+            return "s" if state.search_count <= 4 or auto_suppressed else auto_key
 
     depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
     if depth >= secret_search_min_depth:
@@ -925,7 +959,7 @@ def choose_action(
         return "s"
     state.search_count = 0
     state.auto_failures = 0
-    return "s" if auto_blocked_by_monster else auto_key
+    return "s" if auto_suppressed else auto_key
 
 
 def choose_survival_action(
@@ -935,6 +969,8 @@ def choose_survival_action(
     rest_hp_frac: float,
     rest_min_depth: int,
     equip_items: bool,
+    safe_id_potions_min_depth: int,
+    safe_id_scrolls_min_depth: int,
     panic_items: bool,
     panic_min_depth: int,
     panic_scrolls: bool,
@@ -942,6 +978,7 @@ def choose_survival_action(
     panic_zaps: bool,
     panic_zaps_min_depth: int,
     panic_ranged_first: bool,
+    avoid_zapping_jellies: bool,
     reuse_offensive_zaps: bool,
     reuse_offensive_zaps_min_depth: int,
     reuse_offensive_zaps_max_hp_frac: float,
@@ -972,6 +1009,16 @@ def choose_survival_action(
         if equip_action is not None and not danger:
             return equip_action
 
+    if not danger:
+        if safe_id_potions_min_depth > 0 and depth >= safe_id_potions_min_depth:
+            potion_action = choose_safe_identify_item_action(obs, state, POTION_CATEGORY)
+            if potion_action is not None:
+                return potion_action
+        if safe_id_scrolls_min_depth > 0 and depth >= safe_id_scrolls_min_depth:
+            scroll_action = choose_safe_identify_item_action(obs, state, SCROLL_CATEGORY)
+            if scroll_action is not None:
+                return scroll_action
+
     if not panic_items or depth < panic_min_depth:
         return None
 
@@ -998,6 +1045,7 @@ def choose_survival_action(
         include_scrolls=panic_scrolls and depth >= panic_scrolls_min_depth,
         include_zaps=panic_zaps and depth >= panic_zaps_min_depth,
         ranged_first=panic_ranged_first,
+        avoid_zapping_jellies=avoid_zapping_jellies,
         reuse_offensive_zaps=(
             reuse_offensive_zaps
             and depth >= reuse_offensive_zaps_min_depth
@@ -1406,6 +1454,29 @@ def choose_throw_action(obs: ObservationDict, state: PolicyState) -> str | None:
     return "t"
 
 
+def choose_safe_identify_item_action(
+    obs: ObservationDict,
+    state: PolicyState,
+    category_mask: int,
+) -> str | None:
+    for slot in inventory_slots(obs, category_mask):
+        letter = item_letter(obs, slot)
+        if not letter:
+            continue
+        key = item_key(obs, slot)
+        if key in state.tried_items:
+            continue
+        state.tried_items.add(key)
+        state.clear_path()
+        if category_mask & SCROLL_CATEGORY:
+            state.pending_item_prompt = "scroll"
+            state.action_queue.append(letter)
+        else:
+            state.action_queue.extend([letter, "\x1b"])
+        return "a"
+    return None
+
+
 def direction_to_nearest_visible_monster(obs: ObservationDict) -> str | None:
     px, py = player_position(obs)
     best: tuple[int, str] | None = None
@@ -1430,6 +1501,7 @@ def choose_panic_item_action(
     include_scrolls: bool,
     include_zaps: bool,
     ranged_first: bool,
+    avoid_zapping_jellies: bool,
     reuse_offensive_zaps: bool,
 ) -> str | None:
     if ranged_first:
@@ -1463,6 +1535,13 @@ def choose_panic_item_action(
             charges = int(obs["inventory_charges"][slot])
             if category & (STAFF_CATEGORY | WAND_CATEGORY) and charges == 0:
                 continue
+            if (
+                avoid_zapping_jellies
+                and category & (STAFF_CATEGORY | WAND_CATEGORY)
+                and nearest_visible_monster_kind(obs) in JELLY_MONSTER_KINDS
+            ):
+                if "lightning" in name or "firebolt" in name or "poison" in name:
+                    continue
             if not reusable_zap and key in state.tried_items:
                 continue
             if not reusable_zap:
@@ -1711,10 +1790,13 @@ def run_search(args: argparse.Namespace) -> list[EpisodeState]:
                     episode.policy,
                     auto_retries=args.auto_retries,
                     fast_autoexplore=args.fast_autoexplore,
+                    disable_auto_min_depth=args.disable_auto_min_depth,
                     descend_min_hp_frac=args.descend_min_hp_frac,
                     rest_hp_frac=args.rest_hp_frac,
                     rest_min_depth=args.rest_min_depth,
                     equip_items=args.equip_items,
+                    safe_id_potions_min_depth=args.safe_id_potions_min_depth,
+                    safe_id_scrolls_min_depth=args.safe_id_scrolls_min_depth,
                     panic_items=args.panic_items,
                     panic_min_depth=args.panic_min_depth,
                     panic_scrolls=args.panic_scrolls,
@@ -1722,6 +1804,7 @@ def run_search(args: argparse.Namespace) -> list[EpisodeState]:
                     panic_zaps=args.panic_zaps,
                     panic_zaps_min_depth=args.panic_zaps_min_depth,
                     panic_ranged_first=args.panic_ranged_first,
+                    avoid_zapping_jellies=args.avoid_zapping_jellies,
                     reuse_offensive_zaps=args.reuse_offensive_zaps,
                     reuse_offensive_zaps_min_depth=args.reuse_offensive_zaps_min_depth,
                     reuse_offensive_zaps_max_hp_frac=args.reuse_offensive_zaps_max_hp_frac,
