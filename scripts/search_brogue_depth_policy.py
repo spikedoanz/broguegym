@@ -433,6 +433,23 @@ def terrain_layers(obs: ObservationDict, x: int, y: int) -> tuple[int, int, int,
     return int(layers[0]), int(layers[1]), int(layers[2]), int(layers[3])
 
 
+def terrain_is_hazardous(
+    dungeon: int,
+    liquid: int,
+    gas: int,
+    surface: int,
+    hazard_tiles: set[int],
+) -> bool:
+    if dungeon in SAFE_BRIDGE_TILES or surface in SAFE_BRIDGE_TILES:
+        return False
+    return (
+        dungeon in hazard_tiles
+        or liquid in hazard_tiles
+        or surface in hazard_tiles
+        or gas in hazard_tiles
+    )
+
+
 def has_monster(obs: ObservationDict, x: int, y: int) -> bool:
     if not in_bounds(x, y):
         return False
@@ -441,39 +458,25 @@ def has_monster(obs: ObservationDict, x: int, y: int) -> bool:
 
 def is_hazardous(obs: ObservationDict, x: int, y: int) -> bool:
     dungeon, liquid, gas, surface = terrain_layers(obs, x, y)
-    if dungeon in SAFE_BRIDGE_TILES or surface in SAFE_BRIDGE_TILES:
-        return False
-    return (
-        dungeon in HAZARD_TILES
-        or liquid in HAZARD_TILES
-        or surface in HAZARD_TILES
-        or gas in HAZARD_TILES
-    )
+    return terrain_is_hazardous(dungeon, liquid, gas, surface, HAZARD_TILES)
 
 
 def is_active_hazardous(obs: ObservationDict, x: int, y: int) -> bool:
     dungeon, liquid, gas, surface = terrain_layers(obs, x, y)
-    if dungeon in SAFE_BRIDGE_TILES or surface in SAFE_BRIDGE_TILES:
-        return False
-    return (
-        dungeon in ACTIVE_HAZARD_TILES
-        or liquid in ACTIVE_HAZARD_TILES
-        or surface in ACTIVE_HAZARD_TILES
-        or gas in ACTIVE_HAZARD_TILES
-    )
+    return terrain_is_hazardous(dungeon, liquid, gas, surface, ACTIVE_HAZARD_TILES)
 
 
 def is_passable(obs: ObservationDict, x: int, y: int, *, avoid_hazards: bool = True) -> bool:
     if not known(obs, x, y):
         return False
-    dungeon, liquid, _gas, surface = terrain_layers(obs, x, y)
+    dungeon, liquid, gas, surface = terrain_layers(obs, x, y)
     if dungeon in {DOWN_STAIRS, UP_STAIRS, FLOOR, DOOR, OPEN_DOOR, LOCKED_DOOR, PORTAL}:
         pass
     elif dungeon in {STATUE_INERT_DOORWAY, STATUE_DORMANT_DOORWAY}:
         pass
     elif dungeon in BLOCKING_DUNGEON_TILES:
         return False
-    if avoid_hazards and is_hazardous(obs, x, y):
+    if avoid_hazards and terrain_is_hazardous(dungeon, liquid, gas, surface, ACTIVE_HAZARD_TILES):
         return False
     if liquid == DEEP_WATER and avoid_hazards:
         return False
