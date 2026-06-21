@@ -68,7 +68,14 @@ STATUE_INERT: Final = 30
 STATUE_DORMANT: Final = 31
 PORTAL: Final = 34
 WALL_MONSTER_DORMANT: Final = 36
-TRAP_DOOR: Final = 57
+TRAP_DOOR_HIDDEN: Final = 55
+TRAP_DOOR: Final = 56
+GAS_TRAP_PARALYSIS_HIDDEN: Final = 57
+GAS_TRAP_PARALYSIS: Final = 58
+MACHINE_PARALYSIS_VENT_HIDDEN: Final = 59
+MACHINE_PARALYSIS_VENT: Final = 60
+MACHINE_PRESSURE_PLATE: Final = 78
+MACHINE_PRESSURE_PLATE_USED: Final = 79
 DEEP_WATER: Final = 86
 SHALLOW_WATER: Final = 87
 CHASM: Final = 89
@@ -134,6 +141,13 @@ BLOCKING_DUNGEON_TILES: Final = {
 HAZARD_TILES: Final = {
     DEEP_WATER,
     CHASM,
+    TRAP_DOOR_HIDDEN,
+    TRAP_DOOR,
+    GAS_TRAP_PARALYSIS_HIDDEN,
+    GAS_TRAP_PARALYSIS,
+    MACHINE_PARALYSIS_VENT_HIDDEN,
+    MACHINE_PARALYSIS_VENT,
+    MACHINE_PRESSURE_PLATE,
     LAVA,
     LAVA_RETRACTABLE,
     LAVA_RETRACTING,
@@ -608,7 +622,7 @@ def secret_search_targets(obs: ObservationDict, searched: set[tuple[int, int]]) 
 
 def descent_hazard_targets(obs: ObservationDict) -> set[tuple[int, int]]:
     targets: set[tuple[int, int]] = set()
-    descent_tiles = {CHASM, HOLE, TRAP_DOOR}
+    descent_tiles = {CHASM, HOLE, TRAP_DOOR_HIDDEN, TRAP_DOOR}
     for y in range(MAP_ROWS):
         for x in range(MAP_COLS):
             if not known(obs, x, y) or has_monster(obs, x, y):
