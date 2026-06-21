@@ -301,6 +301,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-retries", type=int, default=2)
     parser.add_argument("--fast-autoexplore", action="store_true")
     parser.add_argument("--disable-auto-min-depth", type=int, default=0)
+    parser.add_argument("--cancel-auto-hazard", action="store_true")
+    parser.add_argument("--cancel-auto-near-monsters-min-depth", type=int, default=0)
+    parser.add_argument("--cancel-auto-near-monsters-radius", type=int, default=8)
     parser.add_argument("--descend-min-hp-frac", type=float, default=0.0)
     parser.add_argument("--max-no-change-steps", type=int, default=64)
     parser.add_argument("--progress-interval", type=int, default=64)
@@ -745,6 +748,9 @@ def choose_action(
     stuck_dive_min_depth: int,
     stuck_dive_min_hp_frac: float,
     native_stairs: bool,
+    cancel_auto_hazard: bool = False,
+    cancel_auto_near_monsters_min_depth: int = 0,
+    cancel_auto_near_monsters_radius: int = 8,
 ) -> str:
     auto_key = "^x" if fast_autoexplore else "x"
     depth = int(obs["program_state"][PROGRAM_DEPTH_INDEX])
@@ -755,6 +761,15 @@ def choose_action(
     msg = message_text(obs).lower()
     autoexplore_active = "exploring... press any key to stop" in msg
     if disable_auto_min_depth > 0 and depth >= disable_auto_min_depth and autoexplore_active:
+        state.clear_path()
+        return "\x1b"
+    if autoexplore_active and should_cancel_autoexplore(
+        obs,
+        depth=depth,
+        cancel_auto_hazard=cancel_auto_hazard,
+        cancel_auto_near_monsters_min_depth=cancel_auto_near_monsters_min_depth,
+        cancel_auto_near_monsters_radius=cancel_auto_near_monsters_radius,
+    ):
         state.clear_path()
         return "\x1b"
     if "press space" in msg or "--more--" in msg:
@@ -1072,6 +1087,25 @@ def choose_survival_action(
     if panic_action is not None:
         return panic_action
     return None
+
+
+def should_cancel_autoexplore(
+    obs: ObservationDict,
+    *,
+    depth: int,
+    cancel_auto_hazard: bool,
+    cancel_auto_near_monsters_min_depth: int,
+    cancel_auto_near_monsters_radius: int,
+) -> bool:
+    if cancel_auto_hazard:
+        px, py = player_position(obs)
+        if is_active_hazardous(obs, px, py):
+            return True
+    if cancel_auto_near_monsters_min_depth > 0 and depth >= cancel_auto_near_monsters_min_depth:
+        nearest = nearest_visible_monster_distance(obs)
+        if nearest is not None and nearest <= cancel_auto_near_monsters_radius:
+            return True
+    return False
 
 
 def choose_avoidance_action(
@@ -1808,6 +1842,9 @@ def run_search(args: argparse.Namespace) -> list[EpisodeState]:
                     auto_retries=args.auto_retries,
                     fast_autoexplore=args.fast_autoexplore,
                     disable_auto_min_depth=args.disable_auto_min_depth,
+                    cancel_auto_hazard=args.cancel_auto_hazard,
+                    cancel_auto_near_monsters_min_depth=args.cancel_auto_near_monsters_min_depth,
+                    cancel_auto_near_monsters_radius=args.cancel_auto_near_monsters_radius,
                     descend_min_hp_frac=args.descend_min_hp_frac,
                     rest_hp_frac=args.rest_hp_frac,
                     rest_min_depth=args.rest_min_depth,
