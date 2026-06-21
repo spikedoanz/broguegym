@@ -30,6 +30,16 @@ obs, reward, term, trunc, info = env.step(env.action_space.sample())
 env.close()
 ```
 
+Terminal:
+
+```bash
+uv run broguegym-play --seed 1
+```
+
+The terminal frontend prints one JSON state line and then the rendered board after reset and each
+key. Use `--actions ' z'` to replay raw keys non-interactively, or `--tensors` to include the
+privileged tensor repr before each board render.
+
 Batched (for training):
 
 ```python
