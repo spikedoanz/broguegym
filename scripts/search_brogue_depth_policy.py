@@ -32,6 +32,8 @@ from broguegym.spaces import (
 
 MAP_COLS: Final = 79
 MAP_ROWS: Final = 29
+SCREEN_COLS: Final = 100
+SCREEN_ROWS: Final = 34
 SCREEN_MAP_X0: Final = 21
 SCREEN_MAP_Y0: Final = 3
 
@@ -353,6 +355,21 @@ def parse_args() -> argparse.Namespace:
 def message_text(obs: ObservationDict) -> str:
     raw = bytes(obs["message"].tolist()).split(b"\0", 1)[0]
     return raw.decode("latin-1", errors="replace")
+
+
+def screen_has_text(obs: ObservationDict, text: str) -> bool:
+    needle = [ord(char) for char in text]
+    if not needle:
+        return False
+    chars = obs["chars"]
+    if chars.ndim == 1:
+        chars = chars.reshape(SCREEN_ROWS, SCREEN_COLS)
+    for row in chars:
+        values = [int(char) & 0xFF for char in row]
+        for start in range(0, len(values) - len(needle) + 1):
+            if values[start : start + len(needle)] == needle:
+                return True
+    return False
 
 
 def stats_from_obs(obs: ObservationDict) -> tuple[int, int, int, int, bool]:
@@ -772,7 +789,7 @@ def choose_action(
     ):
         state.clear_path()
         return "\x1b"
-    if "press space" in msg or "--more--" in msg:
+    if "press space" in msg or "--more--" in msg or screen_has_text(obs, "--MORE--"):
         state.clear_path()
         return " "
     if "game over" in msg or "press any key" in msg and "stop" not in msg:
