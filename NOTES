@@ -1,0 +1,2 @@
+> multithreading is the right answer ultimately, and NLE already showed us a case example for this.
+> an interim mode where a parent C process manages multiple brogue instances (in process) is a good start, but not the end all be all.

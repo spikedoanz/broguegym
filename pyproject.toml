@@ -14,6 +14,10 @@ dependencies = [
     "typing-extensions>=4.12.0",
 ]
 
+[project.scripts]
+broguegym-play = "broguegym.compact_cli:main"
+broguegym-compact-play = "broguegym.compact_cli:main"
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.409",
