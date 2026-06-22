@@ -779,7 +779,7 @@ def choose_action(
     autoexplore_active = "exploring... press any key to stop" in msg
     if disable_auto_min_depth > 0 and depth >= disable_auto_min_depth and autoexplore_active:
         state.clear_path()
-        return "\x1b"
+        state.auto_failures = max(state.auto_failures, auto_retries)
     if autoexplore_active and should_cancel_autoexplore(
         obs,
         depth=depth,
@@ -788,7 +788,7 @@ def choose_action(
         cancel_auto_near_monsters_radius=cancel_auto_near_monsters_radius,
     ):
         state.clear_path()
-        return "\x1b"
+        state.auto_failures = max(state.auto_failures, auto_retries)
     if "press space" in msg or "--more--" in msg or screen_has_text(obs, "--MORE--"):
         state.clear_path()
         return " "
